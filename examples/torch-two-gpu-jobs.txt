@@ -1,0 +1,3 @@
+# Two deep learning style jobs that each hold roughly 2000 MB for 30 seconds.
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30

@@ -1,0 +1,5 @@
+# Four jobs for interactive workflow demos.
+python -c "import time; print('job 1 start'); time.sleep(30); print('job 1 done')"
+python -c "import time; print('job 2 start'); time.sleep(30); print('job 2 done')"
+python -c "import time; print('job 3 start'); time.sleep(30); print('job 3 done')"
+python -c "import time; print('job 4 start'); time.sleep(30); print('job 4 done')"

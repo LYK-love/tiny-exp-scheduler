@@ -1,0 +1,5 @@
+# Four deep learning style jobs for 4 GPUs.
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30
+python examples/torch_hold_gpu.py --mb 2000 --seconds 30
