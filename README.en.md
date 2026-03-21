@@ -2,13 +2,15 @@
 
 # tiny-exp-scheduler
 
-`tiny-exp-scheduler` is a minimal, explicit tmux scheduler for single-machine GPU / deep learning workloads.
+`tiny-exp-scheduler` is a lightweight scheduler for single-machine GPU experiments. You give it a list of shell commands, and it launches them in tmux, assigns available GPUs, and writes each command's output to log files.
 
-It does not generate commands and it does not interpret command meaning. It only does three things:
+It does not generate commands and it does not interpret command meaning. It handles a small, explicit set of responsibilities:
 
-- treat each input line as one shell job
-- open one tmux tab per job in the current session
-- schedule those jobs over a frozen CUDA device range and write logs
+- treat each input line as one job
+- occupy the current tmux tab as the scheduler window
+- open one new tab per job in the same tmux session
+- decide which GPUs are allowed for this run at startup, then schedule only within that set
+- record logs and final status for each job
 
 For deeper details, see the [design document](docs/design.en.md).  
 For runnable examples, see [workflow demos](docs/workflows.en.md).
@@ -19,21 +21,21 @@ For runnable examples, see [workflow demos](docs/workflows.en.md).
 commands.txt
     |
     v
-current tmux tab
+tmux session
     |
-    +--> __scheduler__
-    +--> job_1
-    +--> job_2
+    +--> current tab -> __scheduler__
+    +--> appended tab -> job_1
+    +--> appended tab -> job_2
     +--> ...
 ```
 
-GPU selection happens once at startup:
+The allowed GPU range is decided only once at startup:
 
 ```text
 --cuda-devices auto
     |
-    +--> detect idle GPUs once
-    +--> freeze that set
+    +--> check which GPUs are idle at startup
+    +--> record them as the GPUs allowed for this run
     +--> use only that set for the whole run
 ```
 
@@ -68,28 +70,31 @@ tiny-exp-scheduler run [commands.txt] [--dry-run]
 cat commands.txt | tiny-exp-scheduler run --cuda-devices auto
 ```
 
-Runtime requirements:
+Before running:
 
-- you must already be inside a tmux session
+- you must already be inside a tmux session and sitting in one tab
+
+After startup:
+
 - the current tab is renamed to `__scheduler__`
 - job tabs are appended after it
 - the `__scheduler__` tab is kept after completion
 - if `__scheduler__` already exists in the current session, the command fails
 
-CUDA selection:
+GPU selection:
 
 - `--cuda-devices auto`
-  detect idle GPUs via `nvidia-smi` at startup and freeze that set
+  inspect GPUs through `nvidia-smi` at startup, then use the currently idle GPUs as the allowed device list for this run
 - `--cuda-devices 0,2,5`
-  use exactly those GPUs; if any one is not idle, the command fails
+  use exactly those GPUs; if any one of them is already busy, the command fails immediately
 - `--idle-memory-threshold-mb N`
-  adjust the `memory.used` cap in the idle rule; default `64`
-- current idle rule:
+  adjust the memory threshold used when deciding whether a GPU counts as idle; default `64`
+- the current idle rule is:
   `memory.used <= threshold` and `utilization.gpu == 0`
 - startup prints the final adopted range, for example:
   `Final CUDA device range: cuda:0,cuda:2,cuda:5`
 - `--dry-run`
-  parse input and resolve the CUDA range without touching tmux tabs or starting jobs
+  read input, inspect GPUs, and print the plan without touching tmux tabs or starting jobs
 
 Input rules:
 
@@ -131,12 +136,16 @@ logs/
   job_2.exit
 ```
 
-Exit mapping:
+After a job ends, the program derives its state from the [exit status / exit code](https://en.wikipedia.org/wiki/Exit_status):
 
-- `0` => Done
-- `130` => Cancelled
-- any other non-zero => Failed
-- missing window and missing `.exit` => Cancelled
+- `0` => `Done`
+  the command finished normally
+- `130` => `Cancelled`
+  typically caused by `Ctrl+C` inside a job tab
+- any other non-zero => `Failed`
+  the command exited with an error
+- missing window and missing `.exit` => `Cancelled`
+  typically caused by killing the job tab directly or killing the whole session
 
 At the end, the `__scheduler__` tab prints a summary with:
 

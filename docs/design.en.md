@@ -1,8 +1,8 @@
 # Design Document
 
-## One Sentence
+## Project Role
 
-`tiny-exp-scheduler` maps line-based shell commands into independent job tabs inside the current tmux session and schedules them over a frozen CUDA device range with a simple polling loop.
+`tiny-exp-scheduler` is a small scheduler for single-machine GPU experiments. It takes a list of ready-made shell commands, turns the current tmux tab into the scheduler window, creates one task tab per command in the same tmux session, and assigns those tasks over a preselected set of GPUs.
 
 ## System View
 
@@ -10,89 +10,90 @@
 commands.txt
     |
     v
-current tmux tab
+tmux session
     |
-    +--> __scheduler__
-    +--> job_1
-    +--> job_2
+    +--> current tab -> __scheduler__
+    +--> appended tab -> job_1
+    +--> appended tab -> job_2
     +--> ...
 ```
 
-Startup path:
+Once started, the program roughly follows this sequence:
 
 ```text
 tiny-exp-scheduler run ...
     |
-    +--> check tmux context
-    +--> resolve CUDA device range
-    +--> rename current tab -> __scheduler__
-    +--> enter polling scheduler loop
+    +--> confirm that it is running inside tmux
+    +--> read the command list
+    +--> decide which GPUs are allowed for this run
+    +--> rename the current tab to __scheduler__
+    +--> enter the polling loop
 ```
 
-## Core Principles
+## Design Principles
 
-- input is command
-- do not parse command meaning
-- do not generate commands
-- only schedule commands
-- keep the scheduler simple
+- execute the command the user wrote
+- do not interpret training arguments, model names, or script semantics
+- do not generate commands or expand parameters
+- only solve queueing, GPU placement, and logging
+- keep the implementation small and explicit
 
-## Input Model
+## Input
 
 Input sources:
 
 - file input: `tiny-exp-scheduler run commands.txt`
 - standard input: `cat commands.txt | tiny-exp-scheduler run`
 
-Rules:
+The input format is intentionally simple:
 
 - ignore empty lines
 - ignore lines starting with `#`
 - each remaining line is one job
 
-## tmux Model
+## tmux Runtime Model
 
 Constraints:
 
-- users must already be inside an existing tmux session
+- users must already be inside an existing tmux session and sitting in one tab
 - the program does not create sessions
 - the current tab is renamed to `__scheduler__`
 - each job gets a new tab named `job_X`
 - `__scheduler__` is kept by default
 - only one `__scheduler__` may exist per session
 
-## GPU Model
+## GPU Selection and Assignment
 
-There is only one option:
+The CLI uses one option to control the GPU range:
 
 ```text
 --cuda-devices auto
 --cuda-devices 0,2,5
 ```
 
-`auto`:
+If `auto` is used:
 
-- find currently idle GPUs through `nvidia-smi` at startup
-- freeze that set as the device pool for this run
-- GPUs that become idle later are not added
+- inspect GPUs through `nvidia-smi` at startup
+- record the currently idle GPUs as the device list allowed for this run
+- GPUs that become idle later are not added to that running scheduler
 
-Explicit list:
+If an explicit list is used:
 
 - use exactly the GPU ids named by the user
 - the program checks that all of them are currently idle
 - if any one is busy, the command fails
 - the range is never silently reduced
 
-Current idle rule:
+The current idle check is:
 
 ```text
 memory.used <= threshold
 utilization.gpu == 0
 ```
 
-Here `threshold` is controlled by `--idle-memory-threshold-mb`, default `64`.
+Here `threshold` is controlled by `--idle-memory-threshold-mb`, with a default of `64`. In other words, a GPU is considered idle only when its memory usage is at most 64 MiB and its GPU utilization is zero.
 
-Frozen-pool semantics:
+Why the GPU list is fixed once at startup:
 
 ```text
 startup:
@@ -102,6 +103,8 @@ startup:
 runtime:
   scheduler only allocates from [0,2,5]
   GPU 3 becoming idle later does not change the pool
+
+This keeps the resource boundary stable for a single run instead of letting it drift as other workloads on the machine change over time.
 ```
 
 ## Job State Machine
@@ -113,28 +116,28 @@ Pending
   -> Done / Failed / Cancelled
 ```
 
-Meaning:
+The states mean:
 
 - `Pending`: no GPU yet
 - `Scheduled`: GPU assigned, waiting to start
 - `Running`: tmux job tab created
-- `Done`: exit code `0`
+- `Done`: exit status / exit code `0`
 - `Failed`: non-zero other than `130`
-- `Cancelled`: exit code `130`, or missing window with no `.exit`
+- `Cancelled`: exit status `130`, or a missing window with no `.exit`
 
 ## Scheduler Loop
 
-Pseudocode:
+The scheduler wakes up periodically and does this:
 
 ```text
 loop:
-  schedule pending jobs onto frozen CUDA pool
-  start scheduled jobs in tmux tabs
-  finalize running jobs whose tabs disappeared
+  assign available GPUs to jobs that have not started yet
+  start jobs that already have a GPU assigned
+  detect running jobs whose tabs have disappeared
   sleep(tick_seconds)
 ```
 
-Fixed order:
+The order is fixed:
 
 ```text
 1. Pending -> Scheduled
@@ -142,9 +145,9 @@ Fixed order:
 3. Running -> Finished
 ```
 
-## Execution Model
+## Actual Command Execution
 
-Each job is materialized as an explicit shell script:
+Each job is materialized as an explicit shell script like this:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<gpu_id> \
@@ -153,13 +156,13 @@ PYTHONUNBUFFERED=1 \
 2>&1 | tee logs/job_X.log
 ```
 
-The script also:
+Besides running the raw command, the script also:
 
 - prints job metadata
 - enables `set -o pipefail`
 - writes `logs/job_X.exit`
 
-## Logs and Exit Codes
+## Logs and Final State
 
 ```text
 logs/
@@ -169,14 +172,18 @@ logs/
   job_2.exit
 ```
 
-Mapping:
+After a job ends, the program derives its state from the [exit status / exit code](https://en.wikipedia.org/wiki/Exit_status):
 
 - `0` -> `Done`
+  the command finished normally
 - `130` -> `Cancelled`
+  usually caused by user `Ctrl+C`
 - any other non-zero -> `Failed`
+  the command exited with an error
 - missing `.exit` with a missing window -> `Cancelled`
+  usually caused by killing a job tab directly or killing the whole session
 
-## Edge Cases
+## Common Interrupt Scenarios
 
 `Ctrl+C`:
 

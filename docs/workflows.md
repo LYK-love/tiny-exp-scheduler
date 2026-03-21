@@ -14,10 +14,10 @@ tmux new-session -s exp
 - `torch.cuda.is_available()` 为真
 - 机器上有可用 GPU
 
-快速流程图：
+运行时的标签页（tab）关系大致如下：
 
 ```text
-launch tab
+启动命令所在标签页
   -> __scheduler__
   -> job_1
   -> job_2
@@ -34,7 +34,7 @@ launch tab
 
 预期：
 
-- 当前 tab 变成 `__scheduler__`
+- 当前标签页变成 `__scheduler__`
 - `job_1` 先跑
 - `job_2` 等 `job_1` 结束后再跑
 
@@ -61,11 +61,11 @@ cat logs/job_2.exit
 
 预期：
 
-- 当前 tab 变成 `__scheduler__`
+- 当前标签页变成 `__scheduler__`
 - 出现 `job_1` 到 `job_4`
-- 四个 job 几乎同时启动
+- 四个任务几乎同时启动
 
-## 3. Deep Learning 风格 GPU 占用
+## 3. 贴近深度学习实验的 GPU 占用示例
 
 单 GPU 排队：
 
@@ -88,7 +88,7 @@ cat logs/job_2.exit
 预期：
 
 - `job_1` 到 `job_4` 同时启动
-- 每个 job 绑定一个 GPU
+- 每个任务绑定一个 GPU
 
 ## 4. 不在 tmux 中启动
 
@@ -101,7 +101,7 @@ cat logs/job_2.exit
 预期：
 
 - 直接报错
-- 错误说明必须在已有 tmux session 内运行
+- 错误说明必须在已有 tmux 会话（session）内运行
 
 ## 5. Dry Run
 
@@ -114,9 +114,9 @@ cat logs/job_2.exit
 预期：
 
 - 打印最终 CUDA 范围
-- 打印 job 数和 logs 目录
-- 不改 tmux tab
-- 不启动任何 job
+- 打印任务数和日志目录
+- 不改 tmux 标签页
+- 不启动任何任务
 
 ## 6. 运行中按 Ctrl+C
 
@@ -128,15 +128,15 @@ cat logs/job_2.exit
 
 操作：
 
-- 进入某个运行中的 job tab
+- 进入某个运行中的任务标签页
 - 按 `Ctrl+C`
 
 预期：
 
-- 对应 job 进入 `Cancelled`
+- 对应任务进入 `Cancelled`
 - 对应 `.exit` 文件为 `130`
 - GPU 被释放
-- 其他 job 继续运行
+- 其他任务继续运行
 
 检查：
 
@@ -144,7 +144,7 @@ cat logs/job_2.exit
 cat logs/job_2.exit
 ```
 
-## 7. 直接关闭一个 job tab
+## 7. 直接关闭一个任务标签页
 
 命令：
 
@@ -162,7 +162,7 @@ tmux kill-window -t exp:job_3
 
 - `job_3` 视为 `Cancelled`
 - GPU 被释放
-- 其他 job 继续运行
+- 其他任务继续运行
 
 ## 8. 关闭整个 session
 
@@ -180,8 +180,8 @@ tmux kill-session -t exp
 
 预期：
 
-- 所有运行中 job 被视为结束
-- 缺少 `.exit` 的 job 视为 `Cancelled`
+- 所有运行中的任务被视为结束
+- 缺少 `.exit` 的任务视为 `Cancelled`
 - 所有 GPU 被释放
 
 ## 9. 从标准输入读取任务
