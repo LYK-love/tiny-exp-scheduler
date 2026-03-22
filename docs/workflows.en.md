@@ -65,7 +65,52 @@ Expected:
 - `job_1` through `job_4` appear
 - all four jobs start almost at once
 
-## 3. Deep-learning-style GPU hold
+## 3. One Script Invocation Per Line
+
+This is the most common pattern when experiments share environment setup.
+
+Wrapper script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+export PYTHONPATH="${PROJECT_ROOT}/src"
+export DATASET_PATH="${PROJECT_ROOT}/dataset/pong/test"
+export BACKEND_ENDPOINT="http://209.137.198.192:7263"
+
+python "${PROJECT_ROOT}/src/tools/run_experiment.py" \
+  --dataset-path "${DATASET_PATH}" \
+  --backend-endpoint "${BACKEND_ENDPOINT}" \
+  --run-name "$1"
+```
+
+`commands.txt`:
+
+```text
+bash scripts/run_experiment.sh exp_a
+bash scripts/run_experiment.sh exp_b
+bash scripts/run_experiment.sh exp_c
+bash scripts/run_experiment.sh exp_d
+```
+
+Command:
+
+```bash
+./target/release/tiny-exp-scheduler run commands.txt --cuda-devices 0,1,2,3
+```
+
+Expected:
+
+- each input line is still one complete shell command
+- shared setup stays in one script instead of being duplicated four times
+- `CUDA_VISIBLE_DEVICES` is inherited inside `run_experiment.sh`
+- the scheduler still controls which GPU each task gets
+
+## 4. Deep-learning-style GPU hold
 
 Single-GPU queueing:
 
@@ -90,7 +135,7 @@ Expected:
 - `job_1` through `job_4` start together
 - each job binds one GPU
 
-## 4. Running outside tmux
+## 5. Running outside tmux
 
 Command:
 
@@ -103,7 +148,7 @@ Expected:
 - immediate error
 - message says an existing tmux session is required
 
-## 5. Dry Run
+## 6. Dry Run
 
 Command:
 
@@ -118,7 +163,7 @@ Expected:
 - do not rename the current tmux tab
 - do not start any jobs
 
-## 6. Ctrl+C in one job
+## 7. Ctrl+C in one job
 
 Command:
 
@@ -144,7 +189,7 @@ Check:
 cat logs/job_2.exit
 ```
 
-## 7. Kill one job tab
+## 8. Kill one job tab
 
 Command:
 
@@ -164,7 +209,7 @@ Expected:
 - its GPU is released
 - other jobs continue
 
-## 8. Kill the whole session
+## 9. Kill the whole session
 
 Command:
 
@@ -184,7 +229,7 @@ Expected:
 - jobs without `.exit` become `Cancelled`
 - all GPUs are released
 
-## 9. Read tasks from stdin
+## 10. Read tasks from stdin
 
 Command:
 

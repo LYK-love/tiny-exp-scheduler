@@ -2,41 +2,39 @@
 
 # tiny-exp-scheduler
 
-`tiny-exp-scheduler` 是一个面向单机 GPU 实验的轻量调度工具。你给它一组现成的 shell 命令，它负责在 tmux 中逐个或并发拉起这些命令、分配可用 GPU，并把输出写入日志文件（log files）。
+`tiny-exp-scheduler` 是一个基于 [*tmux*](#术语说明) 的 GPU 任务（job）调度器，适用于单机多卡实验场景。
 
-它不生成命令，也不分析命令内容。它只负责几件很具体的事情：
+它接收一组 shell 命令，自动在可用 GPU 中分配资源，把各条命令并行运行在不同的 [*tmux 标签页*](#术语说明) 中，并记录日志与退出状态。
 
-- 把每一行 shell 命令当成一个任务（job）
-- 占用当前 tmux 标签页（tab）作为调度器窗口
-- 在同一个 tmux 会话（session）里为每个任务新开一个标签页
-- 在启动时确定“本轮允许使用哪些 GPU”，然后只在这些 GPU 里分配任务
-- 记录每个任务的日志和退出状态
+它不负责生成命令，不提供领域特定语言（DSL, domain-specific language），也不处理分布式系统。输入中的每一行都只是一个 shell 命令；调度器负责的范围仅限于 GPU 分配、*tmux* 启动以及任务（job）状态跟踪。
 
-更多细节见：[设计文档](docs/design.md)  
-可运行示例见：[Workflow 示例](docs/workflows.md)
-
-## 心智模型
+## 执行模型
 
 ```text
 commands.txt
     |
     v
-tmux 会话（session）
+__scheduler__ tab
     |
-    +--> 当前标签页 -> __scheduler__
-    +--> 后续新建标签页 -> job_1
-    +--> 后续新建标签页 -> job_2
+    +--> job_1 tab  (GPU a)
+    +--> job_2 tab  (GPU b)
+    +--> job_3 tab  (GPU c)
     +--> ...
 ```
 
-可用 GPU 的范围只在启动时确定一次：
+本次运行允许使用的 GPU 集合（allowed GPU set）会在启动时确定一次，并在整个运行过程中保持不变。
+
+## 调度逻辑
 
 ```text
---cuda-devices auto
-    |
-    +--> 启动时检查当前哪些 GPU 空闲
-    +--> 把这些 GPU 记为“本轮可用”
-    +--> 后续调度只使用这批 GPU
+read jobs
+select allowed GPUs
+while unfinished jobs exist:
+    wait for an allowed GPU to become free
+    launch next job in a new tmux tab
+    set CUDA_VISIBLE_DEVICES for that job
+    record log and exit status
+print final summary
 ```
 
 ## 安装
@@ -45,7 +43,7 @@ tmux 会话（session）
 
 - Rust 1.74+
 - `tmux`
-- `nvidia-smi`
+- NVIDIA System Management Interface（`nvidia-smi`）
 
 构建：
 
@@ -55,56 +53,124 @@ cd tiny-exp-scheduler
 cargo build --release
 ```
 
-二进制：
+二进制文件：
 
 ```bash
 target/release/tiny-exp-scheduler
 ```
 
-## 用法
+## 使用方法
+
+运行前，你必须已经进入一个 *tmux 会话*（tmux session），并位于其中一个 *tmux 标签页*（tmux tab）中。
 
 ```bash
-tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices auto]
-tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices 0,2,5]
-tiny-exp-scheduler run [commands.txt] [--dry-run]
+tiny-exp-scheduler run commands.txt --cuda-devices auto
+tiny-exp-scheduler run commands.txt --cuda-devices 0,2,5
+tiny-exp-scheduler run commands.txt --logs-dir logs
+tiny-exp-scheduler run commands.txt --dry-run
 cat commands.txt | tiny-exp-scheduler run --cuda-devices auto
 ```
 
-运行前，你需要满足：
+启动时会发生这些事情：
 
-- 必须已经进入一个 tmux 会话（session），并位于其中一个标签页（tab）
+- 当前 *tmux 标签页* 会被重命名为 `__scheduler__`
+- 各个任务标签页会在它后面依次创建
+- 如果当前 *tmux 会话* 中已经存在 `__scheduler__`，命令会直接失败
 
-程序启动后，会发生这些事情：
+运行结束后：
 
-- 当前标签页会被重命名为 `__scheduler__`
-- 每个任务对应的标签页会在它后面依次创建
-- 结束后 `__scheduler__` 标签页会保留
-- 如果当前会话里已经有 `__scheduler__`，程序直接失败
+- `__scheduler__` 标签页会保留
+- 调度器会在该标签页中打印最终汇总信息
 
-GPU 选择方式：
+## GPU 选择
 
-- `--cuda-devices auto`
-  启动时通过 `nvidia-smi` 检查当前哪些 GPU 没在忙，然后把它们作为这次运行允许使用的 GPU 列表
-- `--cuda-devices 0,2,5`
-  只允许使用这些 GPU；只要其中有一张卡当前正在忙，程序就直接失败，不会偷偷忽略它
-- `--idle-memory-threshold-mb N`
-  调整“显存占用低于多少才算空闲”的阈值；默认 `64`
-- 当前判断 GPU 是否空闲的标准是：
-  `memory.used <= threshold`，并且 `utilization.gpu == 0`
-- 启动时会打印最终采用的范围，例如：
-  `Final CUDA device range: cuda:0,cuda:2,cuda:5`
-- `--dry-run`
-  只读取输入、检查 GPU，并打印计划，不改 tmux 标签页，不启动任务
+- `--cuda-devices auto`  
+  启动时检查所有 GPU，把当时空闲的 GPU 作为本次运行的允许 GPU 集合（allowed GPU set）。
 
-输入规则：
+- `--cuda-devices 0,2,5`  
+  只使用列出的 GPU。如果其中任意一张卡在启动时处于忙碌状态，命令会直接失败。
 
-- 忽略空行
-- 忽略以 `#` 开头的行
-- 每个剩余行就是一个任务
+空闲判定规则：
+
+```text
+memory.used <= threshold
+and
+utilization.gpu == 0
+```
+
+默认阈值为 `64` 兆字节（MB）。
+
+可以通过下面的参数调整：
+
+```bash
+--idle-memory-threshold-mb N
+```
+
+启动时，调度器会打印最终采用的 GPU 集合，例如：
+
+```text
+Final CUDA device range: cuda:0,cuda:2,cuda:5
+```
+
+- `--dry-run`  
+  只读取输入、检查 GPU，并打印执行计划；不会改动 *tmux* 标签页，也不会启动任何任务（job）。
+
+## 输入规则
+
+- 遵循 shell 语法
+- 忽略空行，以及以 `#` 开头的行，也就是注释
+- 每个剩余行都被视为一个任务（job）
+
+示例：
+
+```text
+# commands.txt
+python train.py --exp exp_a
+python train.py --exp exp_b
+python train.py --exp exp_c
+```
+
+## 脚本模式（Wrapper Script）
+
+推荐的使用模式是：让输入文件中的每一行都保持为一条完整的 shell 命令，而这条命令本身去调用一个脚本文件。
+
+把共享的环境准备逻辑放进一个包装脚本（wrapper script）中。不要在这个脚本里设置 `CUDA_VISIBLE_DEVICES`；这个变量应当由调度器从外部注入。
+
+针对每次运行不同的参数，可以从 `commands.txt` 传给脚本，例如通过 `$1`、`$2` 等位置参数。
+
+示例 `commands.txt`：
+
+```text
+bash scripts/run_experiment.sh exp_a
+bash scripts/run_experiment.sh exp_b
+bash scripts/run_experiment.sh exp_c
+bash scripts/run_experiment.sh exp_d
+```
+
+示例包装脚本（wrapper script）：
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+export PYTHONPATH="${PROJECT_ROOT}/src"
+export DATASET_PATH="${PROJECT_ROOT}/dataset/pong/test"
+export BACKEND_ENDPOINT="http://localhost:8080"
+
+python "${PROJECT_ROOT}/src/tools/run_experiment.py" \
+  --dataset-path "${DATASET_PATH}" \
+  --backend-endpoint "${BACKEND_ENDPOINT}" \
+  --run-name "$1"
+```
+
+`CUDA_VISIBLE_DEVICES` 由调度器设置，并会被任务进程（job process）继承，因此不应在包装脚本中再次指定。
 
 ## 最小示例
 
-先进入 tmux：
+先启动 *tmux*：
 
 ```bash
 tmux new-session -s exp
@@ -116,17 +182,9 @@ tmux new-session -s exp
 tiny-exp-scheduler run examples/basic-queue.txt --cuda-devices 0
 ```
 
-更像 deep learning 的示例：
-
-- [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
-- [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
-- [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
-
-这些例子使用最小的 `torch` 代码，在单个 GPU 上大约占用 2000 MB 显存，并持续几十秒，适合拿来观察调度行为。
-
 ## 日志与状态
 
-默认输出：
+默认输出目录：
 
 ```text
 logs/
@@ -136,24 +194,29 @@ logs/
   job_2.exit
 ```
 
-任务结束后，程序会根据[退出状态码（exit status / exit code）](https://en.wikipedia.org/wiki/Exit_status)判断状态：
+任务状态（job state）由退出状态码（exit status）推导得到：
 
-- `0` => `Done`
-  命令正常结束
-- `130` => `Cancelled`
-  常见于用户在任务标签页中按 `Ctrl+C`
-- 其他非零 => `Failed`
-  命令运行出错
-- 窗口（window）消失且无 `.exit` => `Cancelled`
-  常见于用户直接关闭任务标签页，或整个会话被杀掉
+- `0` -> `Done`
+- `130` -> `Cancelled`
+- 其他非零 -> `Failed`
 
-所有任务结束后，`__scheduler__` 标签页会打印一段汇总信息，包括：
+如果某个任务标签页消失，并且没有找到对应的 `.exit` 文件，调度器会将该任务标记为 `Cancelled`。
 
-- 最终采用的 GPU 范围
+运行结束后，`__scheduler__` 标签页会打印：
+
+- 最终采用的 CUDA 设备范围
 - 日志目录
-- 总任务数
-- `Done / Failed / Cancelled` 数量
-- `Failed / Cancelled` 的任务编号
+- 任务总数
+- `Done` / `Failed` / `Cancelled` 的数量
+- `Failed` / `Cancelled` 的任务编号
+
+## 更多内容
+
+- [设计文档](docs/design.md)
+- [Workflow 示例](docs/workflows.md)
+- [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
+- [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
+- [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
 
 ## 测试
 
@@ -162,8 +225,14 @@ cargo test
 bash scripts/tmux-smoke.sh
 ```
 
+## 术语说明
+
+- [*tmux*](https://github.com/tmux/tmux/wiki)：终端复用器（terminal multiplexer）。
+- 任务（job）：输入文件中一个非空且非注释的行；每个任务都是一条完整的 shell 命令。
+- *tmux 会话*（tmux session）：调度器当前运行所在的 *tmux* 会话。
+- *tmux 标签页*（tmux tab）：本文中对 *tmux window* 的称呼。
+- 允许 GPU 集合（allowed GPU set）：本次运行允许使用的 GPU 集合；它在启动时确定一次。
+
 ## License
 
 MIT
-
-本项目由 AI 和人类共同编写。
