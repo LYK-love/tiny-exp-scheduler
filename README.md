@@ -2,40 +2,13 @@
 
 # tiny-exp-scheduler
 
-`tiny-exp-scheduler` 是一个基于 [*tmux*](#术语说明) 的 GPU 任务（job）调度器，适用于单机多卡实验场景。
+`tiny-exp-scheduler` 是一个基于 [*tmux*](https://github.com/tmux/tmux/wiki) 的单机多卡 GPU 任务调度器。
 
-它接收一组 shell 命令，自动在可用 GPU 中分配资源，把各条命令并行运行在不同的 [*tmux 标签页*](#术语说明) 中，并记录日志与退出状态。
+它只做一件事：给定一组 shell 命令，选择本次运行允许使用的 GPU，在不同的 *tmux* 标签页中并行启动这些命令，并记录日志和退出状态。
 
-它不负责生成命令，不提供领域特定语言（DSL, domain-specific language），也不处理分布式系统。输入中的每一行都只是一个 shell 命令；调度器负责的范围仅限于 GPU 分配、*tmux* 启动以及任务（job）状态跟踪。
+它不负责生成命令，不提供领域特定语言（DSL, domain-specific language），也不处理分布式系统。一个任务（job）就是输入中的一个非空、非注释行；每个任务都必须是一条完整的 shell 命令。
 
-## 执行模型
-
-```text
-commands.txt
-    |
-    v
-__scheduler__ tab
-    |
-    +--> job_1 tab  (GPU a)
-    +--> job_2 tab  (GPU b)
-    +--> job_3 tab  (GPU c)
-    +--> ...
-```
-
-本次运行允许使用的 GPU 集合（allowed GPU set）会在启动时确定一次，并在整个运行过程中保持不变。
-
-## 调度逻辑
-
-```text
-read jobs
-select allowed GPUs
-while unfinished jobs exist:
-    wait for an allowed GPU to become free
-    launch next job in a new tmux tab
-    set CUDA_VISIBLE_DEVICES for that job
-    record log and exit status
-print final summary
-```
+默认情况下，一个运行中的任务会占用一张 GPU。也就是说，这个工具的常规运行模型是“一任务一 GPU”，因此它主要适用于单卡实验。对于少数根本不需要 CUDA 分配的任务，也支持 `none` 模式。
 
 ## 安装
 
@@ -43,111 +16,92 @@ print final summary
 
 - Rust 1.74+
 - `tmux`
-- NVIDIA System Management Interface（`nvidia-smi`）
+- `nvidia-smi`
 
-构建：
+在仓库根目录安装：
 
 ```bash
 git clone git@github.com:LYK-love/tiny-exp-scheduler.git
 cd tiny-exp-scheduler
-cargo build --release
+cargo install --path .
 ```
 
-二进制文件：
+## 快速开始
+
+先启动一个 `tmux` 会话：
 
 ```bash
-target/release/tiny-exp-scheduler
+tmux new-session -s exp
 ```
 
-## 使用方法
+准备 `commands.txt`：
 
-运行前，你必须已经进入一个 *tmux 会话*（tmux session），并位于其中一个 *tmux 标签页*（tmux tab）中。
+```text
+python train.py --exp exp_a
+python train.py --exp exp_b
+```
+
+运行调度器：
 
 ```bash
 tiny-exp-scheduler run commands.txt --cuda-devices auto
-tiny-exp-scheduler run commands.txt --cuda-devices 0,2,5
-tiny-exp-scheduler run commands.txt --logs-dir logs
-tiny-exp-scheduler run commands.txt --dry-run
-cat commands.txt | tiny-exp-scheduler run --cuda-devices auto
 ```
 
-启动时会发生这些事情：
+## 用法
 
-- 当前 *tmux 标签页* 会被重命名为 `__scheduler__`
-- 各个任务标签页会在它后面依次创建
-- 如果当前 *tmux 会话* 中已经存在 `__scheduler__`，命令会直接失败
-
-运行结束后：
-
-- `__scheduler__` 标签页会保留
-- 调度器会在该标签页中打印最终汇总信息
-
-## GPU 选择
-
-- `--cuda-devices auto`  
-  启动时检查所有 GPU，把当时空闲的 GPU 作为本次运行的允许 GPU 集合（allowed GPU set）。
-
-- `--cuda-devices 0,2,5`  
-  只使用列出的 GPU。如果其中任意一张卡在启动时处于忙碌状态，命令会直接失败。
-
-空闲判定规则：
-
-```text
-memory.used <= threshold
-and
-utilization.gpu == 0
-```
-
-默认阈值为 `64` 兆字节（MB）。
-
-可以通过下面的参数调整：
+必须在一个已有的 *tmux 会话*（tmux session）中运行。
 
 ```bash
---idle-memory-threshold-mb N
+tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
+# 或：
+cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 ```
 
-启动时，调度器会打印最终采用的 GPU 集合，例如：
+如果省略 `COMMANDS_FILE`，调度器会从标准输入读取命令。
 
-```text
-Final CUDA device range: cuda:0,cuda:2,cuda:5
-```
+常用选项：
 
-- `--dry-run`  
-  只读取输入、检查 GPU，并打印执行计划；不会改动 *tmux* 标签页，也不会启动任何任务（job）。
+- `--cuda-devices auto`
+- `--cuda-devices none`
+- `--cuda-devices 0,2,5`
+- `--idle-memory-threshold-mb N`
+- `--logs-dir DIR`
+- `--keep-job-tabs`
+- `--tick-seconds N`
+- `--dry-run`
 
-## 输入规则
+关于运行时语义和状态转换，请见[设计文档](docs/design.md)。如果你想看有代表性的实际用法，请见 [Workflow 示例](docs/workflows.md)。
 
-- 遵循 shell 语法
-- 忽略空行，以及以 `#` 开头的行，也就是注释
-- 每个剩余行都被视为一个任务（job）
+## 命令文件
 
-示例：
+命令文件使用 shell 语法，但它本身不是一个要直接执行的 shell 脚本。
 
-```text
-# commands.txt
-python train.py --exp exp_a
-python train.py --exp exp_b
-python train.py --exp exp_c
-```
+输入规则：
 
-## 脚本模式（Wrapper Script）
+- 忽略空行
+- 忽略以 `#` 开头的行
+- 每个其余行都是一个任务（job）
 
-推荐的使用模式是：让输入文件中的每一行都保持为一条完整的 shell 命令，而这条命令本身去调用一个脚本文件。
+惯例上把它命名为 `commands.txt`，是为了强调它是调度器的输入，而不是一个拿来直接 `bash xxx.sh` 的脚本。
 
-把共享的环境准备逻辑放进一个包装脚本（wrapper script）中。不要在这个脚本里设置 `CUDA_VISIBLE_DEVICES`；这个变量应当由调度器从外部注入。
+## 推荐模式
 
-针对每次运行不同的参数，可以从 `commands.txt` 传给脚本，例如通过 `$1`、`$2` 等位置参数。
+推荐把输入文件中的每一行都写成“一条 shell 命令调用一个脚本”。
+
+共享的环境准备逻辑放在包装脚本（wrapper script）里。`CUDA_VISIBLE_DEVICES` 由调度器从外部设置，不要在包装脚本里自行指定。
+
+如果使用 `--cuda-devices none`，调度器就不会设置 `CUDA_VISIBLE_DEVICES`。
 
 示例 `commands.txt`：
 
 ```text
-bash scripts/run_experiment.sh exp_a
-bash scripts/run_experiment.sh exp_b
-bash scripts/run_experiment.sh exp_c
-bash scripts/run_experiment.sh exp_d
+bash scripts/train_one.sh exp_a configs/pong_a.yaml
+bash scripts/train_one.sh exp_b configs/pong_b.yaml
+bash scripts/train_one.sh exp_c configs/pong_c.yaml
+bash scripts/train_one.sh exp_d configs/pong_d.yaml
 ```
 
-示例包装脚本（wrapper script）：
+示例包装脚本：
 
 ```bash
 #!/usr/bin/env bash
@@ -157,32 +111,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 export PYTHONPATH="${PROJECT_ROOT}/src"
-export DATASET_PATH="${PROJECT_ROOT}/dataset/pong/test"
-export BACKEND_ENDPOINT="http://localhost:8080"
+export DATASET_PATH="${PROJECT_ROOT}/dataset/pong/train"
 
-python "${PROJECT_ROOT}/src/tools/run_experiment.py" \
+RUN_NAME="$1"
+CONFIG_PATH="$2"
+
+python src/main.py \
+  --config "${CONFIG_PATH}" \
   --dataset-path "${DATASET_PATH}" \
-  --backend-endpoint "${BACKEND_ENDPOINT}" \
-  --run-name "$1"
+  --run-name "${RUN_NAME}"
 ```
 
-`CUDA_VISIBLE_DEVICES` 由调度器设置，并会被任务进程（job process）继承，因此不应在包装脚本中再次指定。
-
-## 最小示例
-
-先启动 *tmux*：
-
-```bash
-tmux new-session -s exp
-```
-
-然后运行：
-
-```bash
-tiny-exp-scheduler run examples/basic-queue.txt --cuda-devices 0
-```
-
-## 日志与状态
+## 输出
 
 默认输出目录：
 
@@ -194,26 +134,12 @@ logs/
   job_2.exit
 ```
 
-任务状态（job state）由退出状态码（exit status）推导得到：
-
-- `0` -> `Done`
-- `130` -> `Cancelled`
-- 其他非零 -> `Failed`
-
-如果某个任务标签页消失，并且没有找到对应的 `.exit` 文件，调度器会将该任务标记为 `Cancelled`。
-
-运行结束后，`__scheduler__` 标签页会打印：
-
-- 最终采用的 CUDA 设备范围
-- 日志目录
-- 任务总数
-- `Done` / `Failed` / `Cancelled` 的数量
-- `Failed` / `Cancelled` 的任务编号
+调度器会在当前 *tmux* 会话中保留一个名为 `__sched__` 的汇总标签页。
 
 ## 更多内容
 
-- [设计文档](docs/design.md)
 - [Workflow 示例](docs/workflows.md)
+- [设计文档](docs/design.md)
 - [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
 - [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
 - [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
@@ -224,14 +150,6 @@ logs/
 cargo test
 bash scripts/tmux-smoke.sh
 ```
-
-## 术语说明
-
-- [*tmux*](https://github.com/tmux/tmux/wiki)：终端复用器（terminal multiplexer）。
-- 任务（job）：输入文件中一个非空且非注释的行；每个任务都是一条完整的 shell 命令。
-- *tmux 会话*（tmux session）：调度器当前运行所在的 *tmux* 会话。
-- *tmux 标签页*（tmux tab）：本文中对 *tmux window* 的称呼。
-- 允许 GPU 集合（allowed GPU set）：本次运行允许使用的 GPU 集合；它在启动时确定一次。
 
 ## License
 

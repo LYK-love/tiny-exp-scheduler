@@ -37,7 +37,7 @@ tmux send-keys -t "$SESSION_NAME:launch" "cargo run -- run '$COMMANDS_FILE' --cu
 
 for _ in $(seq 1 30); do
   WINDOWS="$(tmux list-windows -t "$SESSION_NAME" -F '#{window_name}')"
-  if echo "$WINDOWS" | grep -q '^__scheduler__$' \
+  if echo "$WINDOWS" | grep -q '^__sched__$' \
     && echo "$WINDOWS" | grep -q '^job_1$' \
     && echo "$WINDOWS" | grep -q '^job_2$'; then
     break
@@ -45,7 +45,7 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-echo "$WINDOWS" | grep -q '^__scheduler__$'
+echo "$WINDOWS" | grep -q '^__sched__$'
 echo "$WINDOWS" | grep -q '^job_1$'
 echo "$WINDOWS" | grep -q '^job_2$'
 

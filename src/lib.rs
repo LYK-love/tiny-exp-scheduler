@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const SCHEDULER_WINDOW_NAME: &str = "__scheduler__";
+const SCHEDULER_WINDOW_NAME: &str = "__sched__";
 
 struct TmuxClient;
 
@@ -90,7 +90,13 @@ impl TmuxClient {
             .any(|name| name == window_name))
     }
 
-    fn start_job_window(&self, session: &str, window_name: &str, script: &str) -> io::Result<()> {
+    fn start_job_window(
+        &self,
+        session: &str,
+        window_name: &str,
+        script: &str,
+        keep_on_exit: bool,
+    ) -> io::Result<()> {
         let shell_command = build_tmux_shell_command(script);
         let status = Command::new("tmux")
             .args([
@@ -103,14 +109,54 @@ impl TmuxClient {
                 &shell_command,
             ])
             .status()?;
+        if !status.success() {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to start tmux window: {window_name}"),
+            ))
+        } else if keep_on_exit {
+            self.set_remain_on_exit(session, window_name, true)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_remain_on_exit(
+        &self,
+        session: &str,
+        window_name: &str,
+        enabled: bool,
+    ) -> io::Result<()> {
+        let value = if enabled { "on" } else { "off" };
+        let target = format!("{session}:{window_name}");
+        let status = Command::new("tmux")
+            .args(["set-option", "-t", &target, "remain-on-exit", value])
+            .status()?;
         if status.success() {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("failed to start tmux window: {window_name}"),
+                format!("failed to set remain-on-exit for {window_name}"),
             ))
         }
+    }
+
+    fn pane_dead(&self, session: &str, window_name: &str) -> io::Result<bool> {
+        let target = format!("{session}:{window_name}");
+        let output = Command::new("tmux")
+            .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .map(|line| line.trim() == "1")
+            .unwrap_or(false))
     }
 }
 
@@ -168,6 +214,7 @@ pub struct RunOptions {
     pub idle_memory_threshold_mb: usize,
     pub tick_seconds: u64,
     pub dry_run: bool,
+    pub keep_job_tabs: bool,
 }
 
 impl Default for RunOptions {
@@ -179,6 +226,7 @@ impl Default for RunOptions {
             idle_memory_threshold_mb: 64,
             tick_seconds: 1,
             dry_run: false,
+            keep_job_tabs: false,
         }
     }
 }
@@ -186,6 +234,7 @@ impl Default for RunOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CudaDevicesArg {
     Auto,
+    None,
     Explicit(Vec<usize>),
 }
 
@@ -264,6 +313,9 @@ fn parse_run_args(argv: &[String]) -> Result<CliAction, String> {
             "--dry-run" => {
                 options.dry_run = true;
             }
+            "--keep-job-tabs" => {
+                options.keep_job_tabs = true;
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("unknown option: {arg}\n\n{}", help_text()));
             }
@@ -286,50 +338,43 @@ pub fn help_text() -> String {
 A minimal tmux-based scheduler for explicit shell commands on selected CUDA devices.
 
 USAGE:
-  tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices auto]
-  tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices 0,2,5]
-  tiny-exp-scheduler run < commands.txt
+  tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
+  cat commands.txt | tiny-exp-scheduler run [OPTIONS]
   tiny-exp-scheduler -h | --help
 
 MODEL:
   Run inside an existing tmux session.
-  The current tab becomes __scheduler__.
+  The current tab becomes __sched__.
   Job tabs are appended after it.
-
-  current tab
-      |
-      +--> __scheduler__
-      +--> job_1
-      +--> job_2
-      +--> ...
+  The scheduler tab stays open for the final summary.
 
 OPTIONS:
   --logs-dir DIR      Directory for log and exit-code files. Default: logs
-  --cuda-devices ARG  'auto' or a comma-separated list like 0,2,5.
+  --cuda-devices ARG  'auto', 'none', or a comma-separated list like 0,2,5.
                       Default: auto
   --idle-memory-threshold-mb N
                       Max memory.used for an idle GPU. Default: 64
   --tick-seconds N    Scheduler polling interval in seconds. Default: 1
   --dry-run           Resolve GPUs and print the plan without touching tmux.
+  --keep-job-tabs     Keep finished job tabs open in tmux. Default: off
   -h, --help          Show this help message.
 
 CUDA DEVICES:
   auto                Detect idle GPUs once at startup and freeze that set.
+  none                Do not allocate GPUs or set CUDA_VISIBLE_DEVICES.
   0,2,5               Use exactly these GPUs; all must already be idle.
   idle rule           memory.used <= threshold and utilization.gpu == 0
-  startup output      Prints the final adopted CUDA device range.
+  startup output      Prints the final CUDA device range.
 
 INPUT RULES:
   - ignore empty lines
   - ignore lines starting with '#'
   - each remaining line is one job
 
-SCHEDULER LOOP:
-  loop:
-    schedule pending jobs onto the frozen CUDA pool
-    start scheduled jobs in tmux tabs
-    finalize jobs whose tabs disappeared
-    sleep(tick_seconds)
+RUNTIME:
+  By default, one running job occupies one GPU.
+  By default, finished job tabs exit and disappear.
+  With --keep-job-tabs, finished job tabs stay visible in tmux.
 "#;
     text.to_string()
 }
@@ -346,7 +391,7 @@ pub fn run(options: RunOptions) -> io::Result<()> {
 
     let gpu_devices =
         resolve_cuda_devices(&options.cuda_devices, options.idle_memory_threshold_mb)?;
-    if gpu_devices.is_empty() {
+    if !matches!(options.cuda_devices, CudaDevicesArg::None) && gpu_devices.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "no usable CUDA devices resolved",
@@ -373,12 +418,15 @@ pub fn run(options: RunOptions) -> io::Result<()> {
     println!("Scheduler tab: {SCHEDULER_WINDOW_NAME}");
     println!("Current tab renamed to {SCHEDULER_WINDOW_NAME}.");
     println!("Job tabs will be appended after it.");
-    println!(
-        "Final CUDA device range: {}",
-        format_cuda_devices(&gpu_devices)
-    );
+    println!("Final CUDA device range: {}", format_cuda_devices(&gpu_devices));
     println!("Logs dir: {}", options.logs_dir.display());
-    let mut scheduler = Scheduler::new(session, options.logs_dir, gpu_devices, commands);
+    let mut scheduler = Scheduler::new(
+        session,
+        options.logs_dir,
+        gpu_devices,
+        commands,
+        options.keep_job_tabs,
+    );
     scheduler.run_loop(Duration::from_secs(options.tick_seconds));
     println!();
     println!("{}", scheduler.summary());
@@ -421,6 +469,9 @@ fn parse_cuda_devices_arg(value: &str) -> Result<CudaDevicesArg, String> {
     if value == "auto" {
         return Ok(CudaDevicesArg::Auto);
     }
+    if value == "none" {
+        return Ok(CudaDevicesArg::None);
+    }
 
     let mut devices = Vec::new();
     for part in value.split(',') {
@@ -449,6 +500,7 @@ pub fn resolve_cuda_devices(
 ) -> io::Result<Vec<usize>> {
     match selection {
         CudaDevicesArg::Auto => resolve_auto_cuda_devices(idle_memory_threshold_mb),
+        CudaDevicesArg::None => Ok(Vec::new()),
         CudaDevicesArg::Explicit(devices) => {
             validate_explicit_cuda_devices(devices, idle_memory_threshold_mb)
         }
@@ -591,6 +643,7 @@ pub struct Scheduler {
     logs_dir: PathBuf,
     device_ids: Vec<usize>,
     gpu_in_use: Vec<bool>,
+    keep_job_tabs: bool,
 }
 
 impl Scheduler {
@@ -599,6 +652,7 @@ impl Scheduler {
         logs_dir: PathBuf,
         device_ids: Vec<usize>,
         commands: Vec<String>,
+        keep_job_tabs: bool,
     ) -> Self {
         let jobs = commands
             .into_iter()
@@ -612,6 +666,7 @@ impl Scheduler {
             logs_dir,
             device_ids,
             gpu_in_use: vec![false; slots],
+            keep_job_tabs,
         }
     }
 
@@ -672,9 +727,12 @@ impl Scheduler {
             if self.jobs[idx].status != JobStatus::Pending {
                 continue;
             }
-            if let Some(gpu_id) = self.acquire_gpu() {
-                let window_name = self.jobs[idx].name();
-                ensure_job_window_absent(&TmuxClient, &self.session, &window_name)?;
+            let window_name = self.jobs[idx].name();
+            ensure_job_window_absent(&TmuxClient, &self.session, &window_name)?;
+            if self.device_ids.is_empty() {
+                self.jobs[idx].gpu_id = None;
+                self.jobs[idx].status = JobStatus::Scheduled;
+            } else if let Some(gpu_id) = self.acquire_gpu() {
                 self.jobs[idx].gpu_id = Some(gpu_id);
                 self.jobs[idx].status = JobStatus::Scheduled;
             }
@@ -687,10 +745,14 @@ impl Scheduler {
             if job.status != JobStatus::Scheduled {
                 continue;
             }
-            let gpu_id = job.gpu_id.expect("scheduled jobs must own a GPU");
             let window_name = job.name();
-            let script = build_script(job, gpu_id);
-            TmuxClient.start_job_window(&self.session, &window_name, &script)?;
+            let script = build_script(job, job.gpu_id);
+            TmuxClient.start_job_window(
+                &self.session,
+                &window_name,
+                &script,
+                self.keep_job_tabs,
+            )?;
             job.window_name = Some(window_name);
             job.status = JobStatus::Running;
         }
@@ -706,7 +768,13 @@ impl Scheduler {
                 .window_name
                 .as_deref()
                 .expect("running jobs must have a window");
-            if !TmuxClient.has_window(&self.session, window_name)? {
+            let window_missing = !TmuxClient.has_window(&self.session, window_name)?;
+            let pane_dead = if window_missing {
+                false
+            } else {
+                TmuxClient.pane_dead(&self.session, window_name)?
+            };
+            if window_missing || pane_dead {
                 self.finish_running_job(idx)?;
             }
         }
@@ -742,6 +810,9 @@ impl Scheduler {
 }
 
 fn format_cuda_devices(devices: &[usize]) -> String {
+    if devices.is_empty() {
+        return "none".to_string();
+    }
     devices
         .iter()
         .map(|id| format!("cuda:{id}"))
@@ -797,12 +868,23 @@ fn build_tmux_shell_command(script: &str) -> String {
     format!("bash -lc {}", shell_quote(script))
 }
 
-pub fn build_script(job: &Job, gpu_id: usize) -> String {
-    let cmd_display = format!("CUDA_VISIBLE_DEVICES={gpu_id} {}", job.cmd);
+pub fn build_script(job: &Job, gpu_id: Option<usize>) -> String {
+    let (gpu_display, cmd_display, runtime_env) = match gpu_id {
+        Some(gpu_id) => (
+            gpu_id.to_string(),
+            format!("CUDA_VISIBLE_DEVICES={gpu_id} {}", job.cmd),
+            format!("CUDA_VISIBLE_DEVICES={gpu_id} \\\nPYTHONUNBUFFERED=1 \\\n"),
+        ),
+        None => (
+            "none".to_string(),
+            format!("PYTHONUNBUFFERED=1 {}", job.cmd),
+            "PYTHONUNBUFFERED=1 \\\n".to_string(),
+        ),
+    };
     format!(
         r#"echo "================================"
 echo "JOB ID: {job_id}"
-echo "GPU: {gpu_id}"
+echo "GPU: {gpu_display}"
 echo "LOG: {log_path}"
 echo "================================"
 echo "[CMD]"
@@ -811,9 +893,7 @@ echo "--------------------------------"
 
 set -o pipefail
 
-CUDA_VISIBLE_DEVICES={gpu_id} \
-PYTHONUNBUFFERED=1 \
-{cmd} \
+{runtime_env}{cmd} \
 2>&1 | tee {log_path_quoted}
 
 EXIT_CODE=$?
@@ -823,9 +903,10 @@ echo $EXIT_CODE > {exit_path_quoted}
 
 exit $EXIT_CODE"#,
         job_id = job.id,
-        gpu_id = gpu_id,
+        gpu_display = gpu_display,
         log_path = job.log_path.display(),
         cmd_display_quoted = shell_quote(&cmd_display),
+        runtime_env = runtime_env,
         cmd = job.cmd,
         log_path_quoted = shell_quote_os(job.log_path.as_os_str()),
         exit_path_quoted = shell_quote_os(job.exit_path.as_os_str()),
@@ -908,6 +989,7 @@ mod tests {
             "--idle-memory-threshold-mb".to_string(),
             "96".to_string(),
             "--dry-run".to_string(),
+            "--keep-job-tabs".to_string(),
         ];
         let parsed = parse_args(&args).unwrap();
         match parsed {
@@ -917,6 +999,7 @@ mod tests {
                 assert_eq!(options.cuda_devices, CudaDevicesArg::Explicit(vec![0, 2]));
                 assert_eq!(options.idle_memory_threshold_mb, 96);
                 assert!(options.dry_run);
+                assert!(options.keep_job_tabs);
             }
             _ => panic!("expected run action"),
         }
@@ -926,10 +1009,13 @@ mod tests {
     fn help_text_explains_tmux_runtime_model() {
         let help = help_text();
         assert!(help.contains("Run inside an existing tmux session."));
-        assert!(help.contains("The current tab becomes __scheduler__."));
+        assert!(help.contains("The current tab becomes __sched__."));
+        assert!(help.contains("By default, finished job tabs exit and disappear."));
         assert!(help.contains("Detect idle GPUs once at startup"));
         assert!(help.contains("--dry-run"));
         assert!(help.contains("--idle-memory-threshold-mb"));
+        assert!(help.contains("--keep-job-tabs"));
+        assert!(help.contains("tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]"));
     }
 
     #[test]
@@ -939,13 +1025,22 @@ mod tests {
             "python eval.py --ckpt 1000".to_string(),
             Path::new("logs"),
         );
-        let script = build_script(&job, 1);
+        let script = build_script(&job, Some(1));
         assert!(script.contains("JOB ID: 1"));
         assert!(script.contains("GPU: 1"));
         assert!(script.contains("set -o pipefail"));
         assert!(script.contains("PYTHONUNBUFFERED=1"));
         assert!(script.contains("tee 'logs/job_1.log'"));
         assert!(script.contains("echo $EXIT_CODE > 'logs/job_1.exit'"));
+    }
+
+    #[test]
+    fn build_script_without_gpu_skips_cuda_visible_devices() {
+        let job = Job::new(1, "python train.py".to_string(), Path::new("logs"));
+        let script = build_script(&job, None);
+        assert!(script.contains("GPU: none"));
+        assert!(script.contains("PYTHONUNBUFFERED=1"));
+        assert!(!script.contains("CUDA_VISIBLE_DEVICES="));
     }
 
     #[test]
@@ -966,6 +1061,14 @@ mod tests {
         assert_eq!(
             parse_cuda_devices_arg("auto").unwrap(),
             CudaDevicesArg::Auto
+        );
+    }
+
+    #[test]
+    fn parse_cuda_devices_accepts_none() {
+        assert_eq!(
+            parse_cuda_devices_arg("none").unwrap(),
+            CudaDevicesArg::None
         );
     }
 
@@ -1039,6 +1142,11 @@ mod tests {
     }
 
     #[test]
+    fn format_cuda_devices_none_is_stable() {
+        assert_eq!(format_cuda_devices(&[]), "none");
+    }
+
+    #[test]
     fn shell_quote_handles_single_quotes() {
         let quoted = shell_quote("python -c 'print(1)'");
         assert_eq!(quoted, r#"'python -c '"'"'print(1)'"'"''"#);
@@ -1080,6 +1188,7 @@ mod tests {
             logs_dir: PathBuf::from("logs"),
             device_ids: vec![0, 1, 2],
             gpu_in_use: vec![false, false, false],
+            keep_job_tabs: false,
         };
 
         let summary = scheduler.summary();
@@ -1101,6 +1210,7 @@ mod tests {
             PathBuf::from("logs"),
             vec![3],
             vec!["python a.py".to_string(), "python b.py".to_string()],
+            false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
         scheduler.jobs[0].gpu_id = Some(3);
@@ -1127,6 +1237,7 @@ mod tests {
             logs_dir.clone(),
             vec![0],
             vec!["python train.py".to_string()],
+            false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
         scheduler.jobs[0].gpu_id = Some(0);
@@ -1148,6 +1259,7 @@ mod tests {
             logs_dir.clone(),
             vec![0],
             vec!["python train.py".to_string()],
+            false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
         scheduler.jobs[0].gpu_id = Some(0);
@@ -1162,7 +1274,7 @@ mod tests {
     #[test]
     fn rename_current_window_command_is_stable() {
         // This only verifies the public name contract used by docs and runtime.
-        assert_eq!(SCHEDULER_WINDOW_NAME, "__scheduler__");
+        assert_eq!(SCHEDULER_WINDOW_NAME, "__sched__");
     }
 
     #[test]
@@ -1174,6 +1286,7 @@ mod tests {
             idle_memory_threshold_mb: 96,
             tick_seconds: 1,
             dry_run: true,
+            keep_job_tabs: false,
         };
         let summary = build_dry_run_summary(&options, &[0, 2], 4);
         assert!(summary.contains("===== Dry Run ====="));
@@ -1187,13 +1300,13 @@ mod tests {
     fn find_window_conflicts_detects_scheduler_and_job_tabs() {
         let existing = vec![
             "shell".to_string(),
-            "__scheduler__".to_string(),
+            "__sched__".to_string(),
             "job_2".to_string(),
         ];
         let conflicts = find_window_conflicts(&existing, 3);
         assert_eq!(
             conflicts,
-            vec!["__scheduler__".to_string(), "job_2".to_string()]
+            vec!["__sched__".to_string(), "job_2".to_string()]
         );
     }
 
@@ -1202,7 +1315,7 @@ mod tests {
         assert_eq!(
             planned_window_names(3),
             vec![
-                "__scheduler__".to_string(),
+                "__sched__".to_string(),
                 "job_1".to_string(),
                 "job_2".to_string(),
                 "job_3".to_string(),

@@ -1,168 +1,354 @@
 # Design Document
 
-## Project Role
+Start with [README.en.md](../README.en.md) for installation and basic usage. See
+[workflows.en.md](workflows.en.md) for representative command patterns.
 
-`tiny-exp-scheduler` is a small scheduler for single-machine GPU experiments. It takes a list of ready-made shell commands, turns the current tmux tab into the scheduler window, creates one task tab per command in the same tmux session, and assigns those tasks over a preselected set of GPUs.
+## 1. System Overview
 
-## System View
+`tiny-exp-scheduler` is a single-machine scheduler for running shell commands in parallel on multiple GPUs.
 
-```text
-commands.txt
-    |
-    v
-tmux session
-    |
-    +--> current tab -> __scheduler__
-    +--> appended tab -> job_1
-    +--> appended tab -> job_2
-    +--> ...
-```
+Its default resource model is one running job per GPU. That makes it primarily a scheduler for
+single-GPU jobs, with an explicit `none` mode for jobs that should not receive any CUDA allocation.
 
-Once started, the program roughly follows this sequence:
+At a high level, the tool does four things:
 
-```text
-tiny-exp-scheduler run ...
-    |
-    +--> confirm that it is running inside tmux
-    +--> read the command list
-    +--> decide which GPUs are allowed for this run
-    +--> rename the current tab to __scheduler__
-    +--> enter the polling loop
-```
+1. read a list of *job*s
+2. resolve the GPU set for this run
+3. launch one running *job* per `tmux` tab
+4. record logs and final status
 
-## Design Principles
+A *job* is one non-empty, non-comment input line. Each *job* is one complete shell command.
 
-- execute the command the user wrote
-- do not interpret training arguments, model names, or script semantics
-- do not generate commands or expand parameters
-- only solve queueing, GPU placement, and logging
-- keep the implementation small and explicit
+## 2. Top-Down Abstractions
 
-## Input
+The system can be understood as five layers.
 
-Input sources:
+### Layer 1: Command Source
 
-- file input: `tiny-exp-scheduler run commands.txt`
-- standard input: `cat commands.txt | tiny-exp-scheduler run`
+The scheduler reads input from either:
 
-The input format is intentionally simple:
+- a command file
+- standard input
+
+The input format is line-oriented:
 
 - ignore empty lines
 - ignore lines starting with `#`
-- each remaining line is one job
+- treat each remaining line as one *job*
 
-## tmux Runtime Model
+The command file uses shell syntax. It is not a shell script to be executed directly.
 
-Constraints:
+### Layer 2: Scheduler Core
 
-- users must already be inside an existing tmux session and sitting in one tab
-- the program does not create sessions
-- the current tab is renamed to `__scheduler__`
-- each job gets a new tab named `job_X`
-- `__scheduler__` is kept by default
-- only one `__scheduler__` may exist per session
+The scheduler core owns:
 
-## GPU Selection and Assignment
+- the pending-job queue
+- the running-job set
+- the fixed GPU pool for this run
+- the main scheduling loop
 
-The CLI uses one option to control the GPU range:
+Its job is to map pending *job*s onto available GPUs and to track state transitions until completion.
+
+### Layer 3: tmux Runtime
+
+The scheduler runs inside an existing `tmux` session.
+
+Within that session:
+
+- the current tab is renamed to `__sched__`
+- each running *job* gets one new tab
+- each job tab contains one pane
+- that pane runs one shell command
+
+So the runtime shape is:
+
+```text
+command source
+    |
+    v
+__sched__
+    |
+    +--> job_1
+    +--> job_2
+    +--> job_3
+    +--> ...
+```
+
+### Layer 4: Job Execution
+
+A running *job* is a shell command materialized with scheduler-controlled environment and logging.
+
+Conceptually, each job is launched as:
+
+```text
+CUDA_VISIBLE_DEVICES=<gpu_id> + raw shell command + log capture + exit capture
+```
+
+The scheduler controls GPU visibility from the outside. The job command itself remains user-defined.
+
+### Layer 5: Persistent Output
+
+For each *job*, the scheduler writes:
+
+- one log file
+- one exit-status file
+
+These files are the persistent record of execution, independent of whether the corresponding `tmux` tab remains visible.
+
+## 3. Architecture
+
+The architecture has five runtime components.
+
+```text
+command file / stdin
+        |
+        v
+  input parser
+        |
+        v
+ scheduler core
+    |       |
+    |       +--> GPU pool manager
+    |
+    +--> tmux tab launcher
+    |
+    +--> status collector
+    |
+    +--> logs / exit files
+```
+
+Their responsibilities are:
+
+- *input parser*: normalize lines into jobs
+- *GPU pool manager*: determine which GPUs this run may use
+- *scheduler core*: assign jobs to free GPUs
+- *tmux tab launcher*: materialize running jobs in tabs
+- *status collector*: detect completion and derive final state
+
+## 4. Workflow
+
+The runtime workflow has three phases.
+
+### Phase 1: Startup
+
+At startup, the scheduler:
+
+1. checks that it is running inside `tmux`
+2. reads jobs from file or stdin
+3. resolves the GPU set for this run
+4. validates startup conditions
+5. renames the current tab to `__sched__`
+
+Startup rejects invalid states such as:
+
+- not running inside `tmux`
+- `__sched__` already existing in the current session
+- no usable GPU under the requested mode
+- an explicitly requested GPU already being busy
+
+### Phase 2: Scheduling Loop
+
+After startup, the scheduler enters a polling loop.
+
+Each iteration does the following:
+
+```text
+1. find free GPUs inside the fixed GPU pool
+2. assign pending jobs to those GPUs
+3. launch newly assigned jobs in tmux tabs
+4. check running jobs for completion
+5. reclaim GPUs from finished jobs
+6. sleep until the next tick
+```
+
+This loop continues until no pending or running jobs remain.
+
+### Phase 3: Shutdown
+
+When all jobs are done, the scheduler:
+
+1. computes final job states
+2. prints the summary in `__sched__`
+3. keeps the `__sched__` tab open
+
+Finished job tabs either disappear immediately or remain visible, depending on `--keep-job-tabs`.
+
+## 5. GPU Workflow
+
+GPU handling is based on a fixed pool model.
+
+### Step 1: Resolve the GPU pool
+
+The scheduler supports three modes:
 
 ```text
 --cuda-devices auto
+--cuda-devices none
 --cuda-devices 0,2,5
 ```
 
 If `auto` is used:
 
 - inspect GPUs through `nvidia-smi` at startup
-- record the currently idle GPUs as the device list allowed for this run
-- GPUs that become idle later are not added to that running scheduler
+- collect the currently idle GPUs
+- freeze that set as the GPU pool for this run
 
 If an explicit list is used:
 
-- use exactly the GPU ids named by the user
-- the program checks that all of them are currently idle
-- if any one is busy, the command fails
-- the range is never silently reduced
+- use exactly the listed GPUs
+- fail if any listed GPU is busy at startup
 
-The current idle check is:
+If `none` is used:
+
+- the scheduler does not allocate GPUs
+- the scheduler does not set `CUDA_VISIBLE_DEVICES`
+- jobs are not limited by GPU-slot count
+
+### Step 2: Use only that pool during scheduling
+
+The scheduler never expands the pool later. GPUs that become idle after startup are ignored unless they were already part of the resolved pool.
+
+### Step 3: Reclaim GPUs from finished jobs
+
+When a running job finishes, its GPU returns to the free subset of the same pool and may be assigned to another pending job.
+
+The idle rule used by `auto` is:
 
 ```text
 memory.used <= threshold
+and
 utilization.gpu == 0
 ```
 
-Here `threshold` is controlled by `--idle-memory-threshold-mb`, with a default of `64`. In other words, a GPU is considered idle only when its memory usage is at most 64 MiB and its GPU utilization is zero.
+The threshold is controlled by `--idle-memory-threshold-mb`.
 
-Why the GPU list is fixed once at startup:
+## 6. Job Workflow
 
-```text
-startup:
-  --cuda-devices auto
-  idle GPUs found -> [0,2,5]
+Each job has two kinds of states:
 
-runtime:
-  scheduler only allocates from [0,2,5]
-  GPU 3 becoming idle later does not change the pool
+- execution states, used by the scheduler loop
+- final result states, shown to the user after execution ends
 
-This keeps the resource boundary stable for a single run instead of letting it drift as other workloads on the machine change over time.
-```
-
-## Job State Machine
+The execution-state machine is:
 
 ```text
-Pending
-  -> Scheduled
-  -> Running
-  -> Done / Failed / Cancelled
+Pending -> Scheduled -> Running -> Finished
 ```
 
-The states mean:
+The final result states are:
 
-- `Pending`: no GPU yet
-- `Scheduled`: GPU assigned, waiting to start
-- `Running`: tmux job tab created
-- `Done`: exit status / exit code `0`
-- `Failed`: non-zero other than `130`
-- `Cancelled`: exit status `130`, or a missing window with no `.exit`
+- `Done`
+- `Failed`
+- `Cancelled`
 
-## Scheduler Loop
-
-The scheduler wakes up periodically and does this:
+So the full picture is:
 
 ```text
-loop:
-  assign available GPUs to jobs that have not started yet
-  start jobs that already have a GPU assigned
-  detect running jobs whose tabs have disappeared
-  sleep(tick_seconds)
+Pending -> Scheduled -> Running -> Finished -> {Done | Failed | Cancelled}
 ```
 
-The order is fixed:
+Here, `Finished` only means that the command is no longer running. After that, the scheduler derives the final result from `tmux` runtime state and the exit file.
+
+### Pending
+
+The job has been parsed but has not yet been assigned a GPU.
+
+### Scheduled
+
+The scheduler has assigned a GPU to the job, but the job has not yet been launched in `tmux`.
+
+### Running
+
+The job has been launched in its own `tmux` tab and is currently occupying one GPU.
+
+Operationally, a job is considered `Running` after its tab and pane have been created and the command has been started there.
+
+### Finished
+
+A job reaches `Finished` when the scheduler determines that the command is no longer alive.
+
+This is detected from `tmux` state in either of these cases:
+
+- the job tab no longer exists
+- the job pane is dead, even if the tab still exists
+
+Once a job reaches `Finished`, the scheduler derives its final result as follows:
+
+- if the exit file exists and the exit code is `0`, the job becomes `Done`
+- if the exit file exists and the exit code is `130`, the job becomes `Cancelled`
+- if the exit file exists and the exit code is any other non-zero value, the job becomes `Failed`
+- if the job tab is gone and no exit file exists, the job becomes `Cancelled`
+
+So `Done`, `Failed`, and `Cancelled` are not parallel to `Running`; they are final classifications assigned after `Finished`.
+
+## 7. tmux Workflow
+
+The scheduler uses `tmux` as the runtime container and as part of job-state detection.
+
+### Scheduler tab
+
+The current tab becomes `__sched__`. It hosts the control loop and the final summary.
+
+### Job tabs
+
+Each launched job gets one tab named `job_X`.
+
+Each job tab contains one pane, and that pane runs one command.
+
+### State detection through tmux
+
+For each running job, the scheduler tracks the corresponding `tmux` tab and pane.
+
+At each scheduler tick, it checks whether:
+
+- the tab still exists
+- the pane is still alive
+
+These checks are used to determine whether the job is still running or has reached `Finished`.
+
+The interpretation is:
+
+- tab exists and pane is alive -> the job is still `Running`
+- tab exists but pane is dead -> the job has reached `Finished`
+- tab is missing -> the job has reached `Finished`
+
+After that, the scheduler consults the exit file to derive `Done`, `Failed`, or `Cancelled`.
+
+### Completion behavior
+
+By default:
+
+- finished job tabs exit and disappear
+
+With `--keep-job-tabs`:
+
+- finished job tabs remain visible for inspection
+- the pane process has still exited
+- the job has still reached `Finished`
+
+This means tab visibility and job liveness are not the same thing: with `--keep-job-tabs`, a tab may remain visible even though the job is no longer running.
+
+## 8. Command Materialization
+
+The scheduler does not interpret job semantics, but it does materialize each raw command into a concrete runtime form.
+
+Conceptually, each job launch adds three things around the raw command:
+
+1. GPU visibility control through `CUDA_VISIBLE_DEVICES`
+2. log capture
+3. exit-status capture
+
+So the runtime form is roughly:
 
 ```text
-1. Pending -> Scheduled
-2. Scheduled -> Running
-3. Running -> Finished
+scheduler env + raw shell command + stdout/stderr capture + exit capture
 ```
 
-## Actual Command Execution
+This is the only place where the scheduler wraps the user command.
 
-Each job is materialized as an explicit shell script like this:
+## 9. Status and Output Model
 
-```bash
-CUDA_VISIBLE_DEVICES=<gpu_id> \
-PYTHONUNBUFFERED=1 \
-<raw command> \
-2>&1 | tee logs/job_X.log
-```
-
-Besides running the raw command, the script also:
-
-- prints job metadata
-- enables `set -o pipefail`
-- writes `logs/job_X.exit`
-
-## Logs and Final State
+The default output shape is:
 
 ```text
 logs/
@@ -172,48 +358,55 @@ logs/
   job_2.exit
 ```
 
-After a job ends, the program derives its state from the [exit status / exit code](https://en.wikipedia.org/wiki/Exit_status):
+Final state is derived as follows:
 
-- `0` -> `Done`
-  the command finished normally
-- `130` -> `Cancelled`
-  usually caused by user `Ctrl+C`
-- any other non-zero -> `Failed`
-  the command exited with an error
-- missing `.exit` with a missing window -> `Cancelled`
-  usually caused by killing a job tab directly or killing the whole session
+- exit code `0` -> `Done`
+- exit code `130` -> `Cancelled`
+- other non-zero exit code -> `Failed`
+- missing exit file with a missing tab -> `Cancelled`
 
-## Common Interrupt Scenarios
+So the scheduler uses both process-exit information and `tmux` runtime state.
 
-`Ctrl+C`:
+## 10. Interrupt Workflow
 
-- usually writes `130`
-- job becomes `Cancelled`
-- GPU is released
+Interrupts enter the system through `tmux` or through process exit.
 
-`kill-window`:
+### Ctrl+C inside a job tab
 
-- window disappears
-- if `.exit` is missing, treat as `Cancelled`
-- GPU is released
+- the command usually exits with `130`
+- the job becomes `Cancelled`
+- the GPU is reclaimed
 
-`kill-session`:
+### Job tab killed manually
+
+- the tab disappears
+- if no exit file exists, the job becomes `Cancelled`
+- the GPU is reclaimed
+
+### Whole tmux session killed
 
 - all running jobs are treated as ended
-- jobs without `.exit` become `Cancelled`
-- GPUs are released
+- jobs without exit files become `Cancelled`
+- all GPUs are reclaimed
 
-## Current CLI
+## 11. CLI Surface
+
+Current command surface:
 
 ```bash
-tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices auto] [--tick-seconds N]
-tiny-exp-scheduler run [commands.txt] [--logs-dir DIR] [--cuda-devices 0,2,5] [--tick-seconds N]
-tiny-exp-scheduler run [commands.txt] [--dry-run]
+tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
+cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 ```
 
-Extra notes:
+Main options:
 
-- `--dry-run` only parses input and resolves the final CUDA range; it does not touch tmux tabs
-- the scheduler summary prints the final CUDA range and logs directory
+- `--cuda-devices auto`
+- `--cuda-devices none`
+- `--cuda-devices 0,2,5`
+- `--idle-memory-threshold-mb N`
+- `--logs-dir DIR`
+- `--tick-seconds N`
+- `--keep-job-tabs`
+- `--dry-run`
 
-This project was written collaboratively by AI and humans.
+`--dry-run` resolves input and planning state, but does not launch jobs or touch `tmux`.
