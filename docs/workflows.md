@@ -1,7 +1,7 @@
 # Workflow Demos
 
 Start with [README.md](../README.md) for installation and basic usage. See
-[design.md](design.md) for the runtime model and state rules behind these examples.
+[cli.md](cli.md) for command options and [design.md](design.md) for the runtime model and state rules behind these examples.
 
 ## Prerequisites
 

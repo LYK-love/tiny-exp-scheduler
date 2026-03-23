@@ -74,7 +74,7 @@ Common options:
 - `--tick-seconds N`
 - `--dry-run`
 
-For runtime semantics and state transitions, see the [design document](docs/design.md). For representative end-to-end usage patterns, see [workflow demos](docs/workflows.md).
+For a full option reference, see [CLI reference](docs/cli.md). For runtime semantics and state transitions, see the [design document](docs/design.md). For representative end-to-end usage patterns, see [workflow demos](docs/workflows.md).
 
 ## Command File Format
 
@@ -155,11 +155,13 @@ Jobs may still write their own logs, checkpoints, or output files elsewhere; tho
 
 ## More
 
+- [CLI reference](docs/cli.md)
 - [workflow demos](docs/workflows.md)
 - [design document](docs/design.md)
-- [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
-- [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
-- [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
+- [examples](./examples)：
+  * [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
+  * [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
+  * [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
 
 ## Tests
 

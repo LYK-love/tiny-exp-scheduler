@@ -1,7 +1,7 @@
 # Design Document
 
 Start with [README.md](../README.md) for installation and basic usage. See
-[workflows.md](workflows.md) for representative command patterns.
+[cli.md](cli.md) for option definitions and [workflows.md](workflows.md) for representative command patterns.
 
 ## 1. System Overview
 
@@ -388,26 +388,3 @@ Interrupts enter the system through `tmux` or through process exit.
 - all running jobs are treated as ended
 - jobs without exit files become `Cancelled`
 - all GPUs are reclaimed
-
-## 11. CLI Surface
-
-Current command surface:
-
-```bash
-tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
-cat commands.txt | tiny-exp-scheduler run [OPTIONS]
-```
-
-Main options:
-
-- `--cuda-devices auto`
-- `--cuda-devices none`
-- `--cuda-devices 0,2,5`
-- `--idle-memory-threshold-mb N`
-- `--logs-dir DIR`
-- `--tick-seconds N`
-- `--keep-job-tabs`
-- `--verbose`
-- `--dry-run`
-
-`--dry-run` resolves input and planning state, but does not launch jobs or touch `tmux`.
