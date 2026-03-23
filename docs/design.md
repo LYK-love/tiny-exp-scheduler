@@ -1,64 +1,66 @@
-# 设计文档
+# Design Document
 
-如果你还没有安装或使用过这个工具，请先看 [README.md](../README.md)。如果你想直接看有代表性的命令模式，请看 [workflows.md](workflows.md)。
+Start with [README.md](../README.md) for installation and basic usage. See
+[workflows.md](workflows.md) for representative command patterns.
 
-## 1. 系统总览
+## 1. System Overview
 
-`tiny-exp-scheduler` 是一个在单机多卡环境中并行运行 shell 命令的调度器。
+`tiny-exp-scheduler` is a single-machine scheduler for running shell commands in parallel on multiple GPUs.
 
-它默认采用“一任务一 GPU”的资源模型。因此，这个工具主要面向单卡任务；对于少数根本不需要 CUDA 分配的任务，也提供显式的 `none` 模式。
+Its default resource model is one running job per GPU. That makes it primarily a scheduler for
+single-GPU jobs, with an explicit `none` mode for jobs that should not receive any CUDA allocation.
 
-从高层看，它只做四件事：
+At a high level, the tool does four things:
 
-1. 读取一组任务（job）
-2. 确定本次运行允许使用的 GPU 集合
-3. 在不同的 `tmux` 标签页中并行启动任务
-4. 记录日志和最终状态
+1. read a list of *job*s
+2. resolve the GPU set for this run
+3. launch one running *job* per `tmux` tab
+4. record logs and final status
 
-一个任务（job）就是输入中的一个非空、非注释行。每个任务都必须是一条完整的 shell 命令。
+A *job* is one non-empty, non-comment input line. Each *job* is one complete shell command.
 
-## 2. 顶层抽象
+## 2. Top-Down Abstractions
 
-整个系统可以理解为五层。
+The system can be understood as five layers.
 
-### Layer 1：命令来源
+### Layer 1: Command Source
 
-调度器从两种来源读取输入：
+The scheduler reads input from either:
 
-- 命令文件
-- 标准输入
+- a command file
+- standard input
 
-输入是逐行解析的：
+The input format is line-oriented:
 
-- 忽略空行
-- 忽略以 `#` 开头的行
-- 每个其余行都视为一个任务（job）
+- ignore empty lines
+- ignore lines starting with `#`
+- treat each remaining line as one *job*
 
-命令文件使用 shell 语法，但它本身不是一个要直接执行的 shell 脚本。
+The command file uses shell syntax. It is not a shell script to be executed directly.
 
-### Layer 2：调度核心
+### Layer 2: Scheduler Core
 
-调度核心维护：
+The scheduler core owns:
 
-- 待运行任务队列
-- 运行中任务集合
-- 本次运行固定的 GPU 池
-- 主调度循环
+- the pending-job queue
+- the running-job set
+- the fixed GPU pool for this run
+- the main scheduling loop
 
-它负责把待运行任务映射到空闲 GPU，并持续跟踪状态变化，直到所有任务结束。
+Its job is to map pending *job*s onto available GPUs and to track state transitions until completion.
 
-### Layer 3：tmux 运行时
+### Layer 3: tmux Runtime
 
-调度器必须运行在一个已有的 `tmux` 会话（session）中。
+The scheduler runs inside an existing `tmux` session.
 
-在这个会话里：
+Within that session:
 
-- 当前标签页会被重命名为 `__sched__`
-- 每个运行中的任务都会得到一个新的标签页
-- 每个任务标签页只包含一个 pane
-- 这个 pane 只运行一条 shell 命令
+- the current tab is renamed to `__sched__`
+- each running *job* gets one new tab
+- each job tab contains one pane
+- that pane runs one shell command
 
-因此运行时形态是：
+So the runtime shape is:
 
 ```text
 command source
@@ -72,30 +74,30 @@ __sched__
     +--> ...
 ```
 
-### Layer 4：任务执行
+### Layer 4: Job Execution
 
-一个运行中的任务，本质上是“原始 shell 命令 + 调度器控制的环境变量 + 日志与退出状态记录”。
+A running *job* is a shell command materialized with scheduler-controlled environment and logging.
 
-概念上，每个任务会以这样的形式启动：
+Conceptually, each job is launched as:
 
 ```text
 CUDA_VISIBLE_DEVICES=<gpu_id> + raw shell command + log capture + exit capture
 ```
 
-GPU 可见性由调度器从外部控制；任务命令本身仍然完全由用户定义。
+The scheduler controls GPU visibility from the outside. The job command itself remains user-defined.
 
-### Layer 5：持久化输出
+### Layer 5: Persistent Output
 
-对于每个任务，调度器都会写出：
+For each *job*, the scheduler writes:
 
-- 一个日志文件
-- 一个退出状态文件
+- one log file
+- one exit-status file
 
-这些文件构成执行结果的持久记录，不依赖对应的 `tmux` 标签页是否还可见。
+These files are the persistent record of execution, independent of whether the corresponding `tmux` tab remains visible.
 
-## 3. 架构
+## 3. Architecture
 
-运行时架构包含五个组件。
+The architecture has five runtime components.
 
 ```text
 command file / stdin
@@ -115,69 +117,69 @@ command file / stdin
     +--> logs / exit files
 ```
 
-各组件职责如下：
+Their responsibilities are:
 
-- *input parser*：把输入行规范化为任务
-- *GPU pool manager*：确定本次运行允许使用哪些 GPU
-- *scheduler core*：把任务分配到空闲 GPU
-- *tmux tab launcher*：在 `tmux` 中启动任务标签页
-- *status collector*：判断任务何时结束，并推导最终状态
+- *input parser*: normalize lines into jobs
+- *GPU pool manager*: determine which GPUs this run may use
+- *scheduler core*: assign jobs to free GPUs
+- *tmux tab launcher*: materialize running jobs in tabs
+- *status collector*: detect completion and derive final state
 
-## 4. 工作流程
+## 4. Workflow
 
-运行过程分为三个阶段。
+The runtime workflow has three phases.
 
-### Phase 1：启动阶段
+### Phase 1: Startup
 
-启动时，调度器会：
+At startup, the scheduler:
 
-1. 检查当前是否运行在 `tmux` 中
-2. 从文件或标准输入读取任务
-3. 确定本次运行允许使用的 GPU 集合
-4. 检查启动条件是否合法
-5. 把当前标签页改名为 `__sched__`
+1. checks that it is running inside `tmux`
+2. reads jobs from file or stdin
+3. resolves the GPU set for this run
+4. validates startup conditions
+5. renames the current tab to `__sched__`
 
-以下情况会在启动阶段直接失败：
+Startup rejects invalid states such as:
 
-- 不在 `tmux` 中运行
-- 当前会话中已经存在 `__sched__`
-- 在当前模式下没有可用 GPU
-- 用户显式指定的某张 GPU 当前处于忙碌状态
+- not running inside `tmux`
+- `__sched__` already existing in the current session
+- no usable GPU under the requested mode
+- an explicitly requested GPU already being busy
 
-### Phase 2：调度循环
+### Phase 2: Scheduling Loop
 
-启动完成后，调度器进入轮询循环。
+After startup, the scheduler enters a polling loop.
 
-每次迭代执行以下步骤：
+Each iteration does the following:
 
 ```text
-1. 在固定 GPU 池中查找空闲 GPU
-2. 为待运行任务分配这些 GPU
-3. 在 tmux 标签页中启动新分配的任务
-4. 检查运行中的任务是否结束
-5. 回收已结束任务占用的 GPU
-6. 休眠到下一次 tick
+1. find free GPUs inside the fixed GPU pool
+2. assign pending jobs to those GPUs
+3. launch newly assigned jobs in tmux tabs
+4. check running jobs for completion
+5. reclaim GPUs from finished jobs
+6. sleep until the next tick
 ```
 
-只要还有待运行任务或运行中任务，这个循环就会继续。
+This loop continues until no pending or running jobs remain.
 
-### Phase 3：结束阶段
+### Phase 3: Shutdown
 
-当所有任务都结束后，调度器会：
+When all jobs are done, the scheduler:
 
-1. 计算最终任务状态
-2. 在 `__sched__` 中打印汇总
-3. 保留 `__sched__` 标签页
+1. computes final job states
+2. prints the summary in `__sched__`
+3. keeps the `__sched__` tab open
 
-已结束的任务标签页是否仍然可见，取决于 `--keep-job-tabs`。
+Finished job tabs either disappear immediately or remain visible, depending on `--keep-job-tabs`.
 
-## 5. GPU 工作流程
+## 5. GPU Workflow
 
-GPU 管理采用“固定 GPU 池”的模型。
+GPU handling is based on a fixed pool model.
 
-### Step 1：确定 GPU 池
+### Step 1: Resolve the GPU pool
 
-调度器支持三种模式：
+The scheduler supports three modes:
 
 ```text
 --cuda-devices auto
@@ -185,32 +187,32 @@ GPU 管理采用“固定 GPU 池”的模型。
 --cuda-devices 0,2,5
 ```
 
-如果使用 `auto`：
+If `auto` is used:
 
-- 启动时通过 `nvidia-smi` 检查 GPU
-- 收集当时空闲的 GPU
-- 将这个集合固定为本次运行的 GPU 池
+- inspect GPUs through `nvidia-smi` at startup
+- collect the currently idle GPUs
+- freeze that set as the GPU pool for this run
 
-如果使用显式列表：
+If an explicit list is used:
 
-- 只使用用户列出的 GPU
-- 只要其中任意一张卡在启动时忙碌，就直接失败
+- use exactly the listed GPUs
+- fail if any listed GPU is busy at startup
 
-如果使用 `none`：
+If `none` is used:
 
-- 调度器不分配 GPU
-- 调度器不设置 `CUDA_VISIBLE_DEVICES`
-- 任务不再受 GPU 槽位数量限制
+- the scheduler does not allocate GPUs
+- the scheduler does not set `CUDA_VISIBLE_DEVICES`
+- jobs are not limited by GPU-slot count
 
-### Step 2：调度期间只使用这个池
+### Step 2: Use only that pool during scheduling
 
-调度器不会在运行过程中扩大 GPU 池。某张 GPU 即使在启动之后才变空闲，只要它不属于启动时确定的 GPU 池，就不会参与这次运行。
+The scheduler never expands the pool later. GPUs that become idle after startup are ignored unless they were already part of the resolved pool.
 
-### Step 3：任务结束后回收 GPU
+### Step 3: Reclaim GPUs from finished jobs
 
-当一个运行中的任务结束后，它占用的 GPU 会回到同一个池的空闲子集中，可以继续分配给后续任务。
+When a running job finishes, its GPU returns to the free subset of the same pool and may be assigned to another pending job.
 
-`auto` 模式使用的空闲判定规则是：
+The idle rule used by `auto` is:
 
 ```text
 memory.used <= threshold
@@ -218,135 +220,135 @@ and
 utilization.gpu == 0
 ```
 
-其中 `threshold` 由 `--idle-memory-threshold-mb` 控制。
+The threshold is controlled by `--idle-memory-threshold-mb`.
 
-## 6. 任务工作流程
+## 6. Job Workflow
 
-每个任务有两类状态：
+Each job has two kinds of states:
 
-- 执行状态：供调度循环使用
-- 最终结果状态：供用户查看
+- execution states, used by the scheduler loop
+- final result states, shown to the user after execution ends
 
-执行状态机是：
+The execution-state machine is:
 
 ```text
 Pending -> Scheduled -> Running -> Finished
 ```
 
-最终结果状态是：
+The final result states are:
 
 - `Done`
 - `Failed`
 - `Cancelled`
 
-完整关系如下：
+So the full picture is:
 
 ```text
 Pending -> Scheduled -> Running -> Finished -> {Done | Failed | Cancelled}
 ```
 
-这里的 `Finished` 只表示“命令已经不再运行”。在这之后，调度器才会结合 `tmux` 运行时状态和退出状态文件，推导出最终结果。
+Here, `Finished` only means that the command is no longer running. After that, the scheduler derives the final result from `tmux` runtime state and the exit file.
 
 ### Pending
 
-任务已经被解析出来，但还没有分配 GPU。
+The job has been parsed but has not yet been assigned a GPU.
 
 ### Scheduled
 
-调度器已经给任务分配了 GPU，但任务还没有在 `tmux` 中启动。
+The scheduler has assigned a GPU to the job, but the job has not yet been launched in `tmux`.
 
 ### Running
 
-任务已经在自己的 `tmux` 标签页中启动，并正在占用一张 GPU。
+The job has been launched in its own `tmux` tab and is currently occupying one GPU.
 
-从运行时角度看，当任务标签页和 pane 都已经创建完成，并且命令已经在其中启动后，任务进入 `Running`。
+Operationally, a job is considered `Running` after its tab and pane have been created and the command has been started there.
 
 ### Finished
 
-当调度器确认命令已经不再存活时，任务进入 `Finished`。
+A job reaches `Finished` when the scheduler determines that the command is no longer alive.
 
-这个判断依赖 `tmux` 运行时状态，满足以下任一条件即可：
+This is detected from `tmux` state in either of these cases:
 
-- 任务标签页已经不存在
-- 任务 pane 已经结束，即使标签页仍然存在
+- the job tab no longer exists
+- the job pane is dead, even if the tab still exists
 
-任务进入 `Finished` 后，调度器再按以下规则推导最终结果：
+Once a job reaches `Finished`, the scheduler derives its final result as follows:
 
-- 如果退出状态文件存在，且退出状态码为 `0`，任务记为 `Done`
-- 如果退出状态文件存在，且退出状态码为 `130`，任务记为 `Cancelled`
-- 如果退出状态文件存在，且退出状态码为其他非零值，任务记为 `Failed`
-- 如果任务标签页已经消失，但没有找到退出状态文件，任务记为 `Cancelled`
+- if the exit file exists and the exit code is `0`, the job becomes `Done`
+- if the exit file exists and the exit code is `130`, the job becomes `Cancelled`
+- if the exit file exists and the exit code is any other non-zero value, the job becomes `Failed`
+- if the job tab is gone and no exit file exists, the job becomes `Cancelled`
 
-因此，`Done`、`Failed`、`Cancelled` 不是和 `Running` 并列的状态；它们是任务已经 `Finished` 之后的最终分类。
+So `Done`, `Failed`, and `Cancelled` are not parallel to `Running`; they are final classifications assigned after `Finished`.
 
-## 7. tmux 工作流程
+## 7. tmux Workflow
 
-调度器把 `tmux` 同时当成运行容器和任务状态检测的一部分。
+The scheduler uses `tmux` as the runtime container and as part of job-state detection.
 
-### 调度器标签页
+### Scheduler tab
 
-当前标签页会被改名为 `__sched__`。它承载控制循环，并在最后显示汇总。
+The current tab becomes `__sched__`. It hosts the control loop and the final summary.
 
-### 任务标签页
+### Job tabs
 
-每个启动的任务都会得到一个名为 `job_X` 的标签页。
+Each launched job gets one tab named `job_X`.
 
-每个任务标签页只包含一个 pane，而这个 pane 只运行一条命令。
+Each job tab contains one pane, and that pane runs one command.
 
-### 通过 tmux 判定状态
+### State detection through tmux
 
-对于每个运行中的任务，调度器都会跟踪对应的 `tmux` 标签页和 pane。
+For each running job, the scheduler tracks the corresponding `tmux` tab and pane.
 
-在每次调度 tick 中，它会检查：
+At each scheduler tick, it checks whether:
 
-- 这个标签页是否仍然存在
-- 这个 pane 是否仍然存活
+- the tab still exists
+- the pane is still alive
 
-这些检查用于判断任务是否仍在运行，还是已经到达 `Finished`。
+These checks are used to determine whether the job is still running or has reached `Finished`.
 
-对应关系是：
+The interpretation is:
 
-- 标签页存在，pane 仍存活 -> 任务仍为 `Running`
-- 标签页存在，但 pane 已结束 -> 任务已到达 `Finished`
-- 标签页不存在 -> 任务已到达 `Finished`
+- tab exists and pane is alive -> the job is still `Running`
+- tab exists but pane is dead -> the job has reached `Finished`
+- tab is missing -> the job has reached `Finished`
 
-在这之后，调度器再读取退出状态文件，进一步推导 `Done`、`Failed` 或 `Cancelled`。
+After that, the scheduler consults the exit file to derive `Done`, `Failed`, or `Cancelled`.
 
-### 完成后的标签页行为
+### Completion behavior
 
-默认情况下：
+By default:
 
-- 已结束的任务标签页会退出并消失
+- finished job tabs exit and disappear
 
-如果启用 `--keep-job-tabs`：
+With `--keep-job-tabs`:
 
-- 已结束的任务标签页会保留，便于检查
-- 但 pane 中的命令进程已经结束
-- 任务也已经到达 `Finished`
+- finished job tabs remain visible for inspection
+- the pane process has still exited
+- the job has still reached `Finished`
 
-因此，标签页是否仍然可见，和任务是否还在运行，并不是同一件事。在 `--keep-job-tabs` 模式下，某个标签页仍然可见，并不意味着其中的任务还活着。
+This means tab visibility and job liveness are not the same thing: with `--keep-job-tabs`, a tab may remain visible even though the job is no longer running.
 
-## 8. 命令展开
+## 8. Command Materialization
 
-调度器不会理解任务本身的业务语义，但它会把原始命令包装成一个明确的运行形式。
+The scheduler does not interpret job semantics, but it does materialize each raw command into a concrete runtime form.
 
-概念上，每个任务启动时，调度器都会在原始命令外层附加三件事：
+Conceptually, each job launch adds three things around the raw command:
 
-1. 通过 `CUDA_VISIBLE_DEVICES` 控制 GPU 可见性
-2. 捕获日志
-3. 捕获退出状态
+1. GPU visibility control through `CUDA_VISIBLE_DEVICES`
+2. log capture
+3. exit-status capture
 
-因此运行时形态大致是：
+So the runtime form is roughly:
 
 ```text
 scheduler env + raw shell command + stdout/stderr capture + exit capture
 ```
 
-这也是调度器唯一包裹用户命令的地方。
+This is the only place where the scheduler wraps the user command.
 
-## 9. 状态与输出模型
+## 9. Status and Output Model
 
-默认输出结构如下：
+The default output shape is:
 
 ```text
 logs/
@@ -356,47 +358,47 @@ logs/
   job_2.exit
 ```
 
-最终状态的推导规则如下：
+Final state is derived as follows:
 
-- 退出状态码为 `0` -> `Done`
-- 退出状态码为 `130` -> `Cancelled`
-- 其他非零退出状态码 -> `Failed`
-- 退出状态文件缺失，且对应标签页也已消失 -> `Cancelled`
+- exit code `0` -> `Done`
+- exit code `130` -> `Cancelled`
+- other non-zero exit code -> `Failed`
+- missing exit file with a missing tab -> `Cancelled`
 
-因此，调度器同时使用进程退出信息和 `tmux` 运行时状态。
+So the scheduler uses both process-exit information and `tmux` runtime state.
 
-## 10. 中断流程
+## 10. Interrupt Workflow
 
-中断可以来自 `tmux` 操作，也可以来自命令本身的退出。
+Interrupts enter the system through `tmux` or through process exit.
 
-### 在任务标签页里按 Ctrl+C
+### Ctrl+C inside a job tab
 
-- 命令通常以 `130` 退出
-- 任务记为 `Cancelled`
-- 占用的 GPU 被回收
+- the command usually exits with `130`
+- the job becomes `Cancelled`
+- the GPU is reclaimed
 
-### 手动关闭任务标签页
+### Job tab killed manually
 
-- 标签页消失
-- 如果没有退出状态文件，任务记为 `Cancelled`
-- 占用的 GPU 被回收
+- the tab disappears
+- if no exit file exists, the job becomes `Cancelled`
+- the GPU is reclaimed
 
-### 整个 tmux 会话被 kill
+### Whole tmux session killed
 
-- 所有运行中的任务都会被视为结束
-- 没有退出状态文件的任务记为 `Cancelled`
-- 所有 GPU 都会被回收
+- all running jobs are treated as ended
+- jobs without exit files become `Cancelled`
+- all GPUs are reclaimed
 
-## 11. CLI 界面
+## 11. CLI Surface
 
-当前命令形式：
+Current command surface:
 
 ```bash
 tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
 cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 ```
 
-主要选项：
+Main options:
 
 - `--cuda-devices auto`
 - `--cuda-devices none`
@@ -405,6 +407,7 @@ cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 - `--logs-dir DIR`
 - `--tick-seconds N`
 - `--keep-job-tabs`
+- `--verbose`
 - `--dry-run`
 
-`--dry-run` 会解析输入和计划状态，但不会真正启动任务，也不会改动 `tmux`。
+`--dry-run` resolves input and planning state, but does not launch jobs or touch `tmux`.

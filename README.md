@@ -1,65 +1,68 @@
-[中文](README.md) | [English](README.en.md)
-
 # tiny-exp-scheduler
 
-`tiny-exp-scheduler` 是一个基于 [*tmux*](https://github.com/tmux/tmux/wiki) 的单机多卡 GPU 任务调度器。
+> You can use AI to translate or explain this document and the rest of the project's documentation in your preferred language.
+>
+> 你可以使用 AI 将本文档和本项目的其他文档翻译成你偏好的语言，或为你解读其中的内容。
 
-它只做一件事：给定一组 shell 命令，选择本次运行允许使用的 GPU，在不同的 *tmux* 标签页中并行启动这些命令，并记录日志和退出状态。
+`tiny-exp-scheduler` is a minimal [*tmux*](https://github.com/tmux/tmux/wiki)-based scheduler for single-GPU deep learning jobs on a single multi-GPU machine.
 
-它不负责生成命令，不提供领域特定语言（DSL, domain-specific language），也不处理分布式系统。一个任务（job）就是输入中的一个非空、非注释行；每个任务都必须是一条完整的 shell 命令。
+Each experiment is a one-line shell command, called a *job*. The scheduler reads a list of jobs, assigns available GPUs, launches them in parallel in separate *tmux* windows, and records logs and exit status.
 
-默认情况下，一个运行中的任务会占用一张 GPU。也就是说，这个工具的常规运行模型是“一任务一 GPU”，因此它主要适用于单卡实验。对于少数根本不需要 CUDA 分配的任务，也支持 `none` 模式。
+It introduces no extra abstractions and no domain-specific language (DSL): everything is plain shell commands and classic Linux tools. By default, each job occupies one GPU; a `none` mode is also available for jobs that should not receive any CUDA allocation.
 
-## 安装
+> I'll consider supporting multi-GPU experiments in future :)
 
-依赖：
+## Installation
+
+Requirements:
 
 - Rust 1.74+
 - `tmux`
 - `nvidia-smi`
 
-在仓库根目录安装：
+Install from source:
 
 ```bash
-git clone git@github.com:LYK-love/tiny-exp-scheduler.git
+git clone https://github.com/LYK-love/tiny-exp-scheduler.git
 cd tiny-exp-scheduler
 cargo install --path .
 ```
 
-## 快速开始
+## Quick Start
 
-先启动一个 `tmux` 会话：
+Start a `tmux` session:
 
 ```bash
 tmux new-session -s exp
 ```
 
-准备 `commands.txt`：
+Prepare `commands.txt`:
 
 ```text
 python train.py --exp exp_a
 python train.py --exp exp_b
 ```
 
-运行调度器：
+Run the scheduler:
 
 ```bash
 tiny-exp-scheduler run commands.txt --cuda-devices auto
 ```
 
-## 用法
+## Usage
 
-必须在一个已有的 *tmux 会话*（tmux session）中运行。
+Run the scheduler inside an existing *tmux* session.
 
 ```bash
 tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
-# 或：
+
+# Or:
 cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 ```
 
-如果省略 `COMMANDS_FILE`，调度器会从标准输入读取命令。
+If `COMMANDS_FILE` is omitted, the scheduler reads from standard input.
 
-常用选项：
+Common options:
 
 - `--cuda-devices auto`
 - `--cuda-devices none`
@@ -67,54 +70,66 @@ cat commands.txt | tiny-exp-scheduler run [OPTIONS]
 - `--idle-memory-threshold-mb N`
 - `--logs-dir DIR`
 - `--keep-job-tabs`
+- `--verbose`
 - `--tick-seconds N`
 - `--dry-run`
 
-关于运行时语义和状态转换，请见[设计文档](docs/design.md)。如果你想看有代表性的实际用法，请见 [Workflow 示例](docs/workflows.md)。
+For runtime semantics and state transitions, see the [design document](docs/design.md). For representative end-to-end usage patterns, see [workflow demos](docs/workflows.md).
 
-## 命令文件
+## Command File Format
 
-命令文件使用 shell 语法，但它本身不是一个要直接执行的 shell 脚本。
+The command file is conventionally named `commands.txt`. It uses shell-like command syntax。
 
-输入规则：
+> Remember that this project does not define a DSL. Everything here is just shell.
 
-- 忽略空行
-- 忽略以 `#` 开头的行
-- 每个其余行都是一个任务（job）
+The `.txt` suffix is intentional: it emphasizes that the file is meant to be read by the scheduler, not executed directly as a `.sh` script.
 
-惯例上把它命名为 `commands.txt`，是为了强调它是调度器的输入，而不是一个拿来直接 `bash xxx.sh` 的脚本。
+The scheduler parses the file as a list of commands rather than running it as a shell script.
 
-## 推荐模式
+Input rules:
 
-推荐把输入文件中的每一行都写成“一条 shell 命令调用一个脚本”。
+- ignore empty lines
+- ignore lines starting with `#`
+- treat each remaining line as one *job*
 
-共享的环境准备逻辑放在包装脚本（wrapper script）里。`CUDA_VISIBLE_DEVICES` 由调度器从外部设置，不要在包装脚本里自行指定。
+## Recommended Pattern
 
-如果使用 `--cuda-devices none`，调度器就不会设置 `CUDA_VISIBLE_DEVICES`。
+Keep each input line as one shell command, and let that command invoke one wrapper script.
 
-示例 `commands.txt`：
+Put shared environment setup in the wrapper script, for example environment activation, common exports, and the final command invocation. Let the scheduler set `CUDA_VISIBLE_DEVICES` from the outside.
+
+If you use `--cuda-devices none`, the scheduler does not set `CUDA_VISIBLE_DEVICES` at all.
+
+Example `commands.txt`:
 
 ```text
-bash scripts/train_one.sh exp_a configs/pong_a.yaml
-bash scripts/train_one.sh exp_b configs/pong_b.yaml
-bash scripts/train_one.sh exp_c configs/pong_c.yaml
-bash scripts/train_one.sh exp_d configs/pong_d.yaml
+bash scripts/train_one.sh exp_a configs/pong_a.yaml data/pong
+bash scripts/train_one.sh exp_b configs/pong_b.yaml data/pong
+bash scripts/train_one.sh exp_c configs/pong_c.yaml data/pong
+bash scripts/train_one.sh exp_d configs/pong_d.yaml data/pong
 ```
 
-示例包装脚本：
+Example wrapper script:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+: "${CONDA_ENV_NAME:=ml}"
 
-export PYTHONPATH="${PROJECT_ROOT}/src"
-export DATASET_PATH="${PROJECT_ROOT}/dataset/pong/train"
+if ! command -v conda >/dev/null 2>&1; then
+  echo "[ERROR] conda was not found in PATH." >&2
+  exit 1
+fi
+
+CONDA_BASE="$(conda info --base)"
+# shellcheck source=/dev/null
+source "${CONDA_BASE}/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV_NAME}"
 
 RUN_NAME="$1"
 CONFIG_PATH="$2"
+DATASET_PATH="$3"
 
 python src/main.py \
   --config "${CONFIG_PATH}" \
@@ -122,9 +137,9 @@ python src/main.py \
   --run-name "${RUN_NAME}"
 ```
 
-## 输出
+## Output
 
-默认输出目录：
+Default scheduler output:
 
 ```text
 logs/
@@ -134,20 +149,23 @@ logs/
   job_2.exit
 ```
 
-调度器会在当前 *tmux* 会话中保留一个名为 `__sched__` 的汇总标签页。
+The scheduler keeps a summary window named `__sched__` in the current *tmux* session.
 
-## 更多内容
+Jobs may still write their own logs, checkpoints, or output files elsewhere; those are not redirected into the scheduler log files. Scheduler logging only captures the command's stdout and stderr.
 
-- [Workflow 示例](docs/workflows.md)
-- [设计文档](docs/design.md)
+## More
+
+- [workflow demos](docs/workflows.md)
+- [design document](docs/design.md)
 - [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
 - [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
 - [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
 
-## 测试
+## Tests
 
 ```bash
 cargo test
+
 bash scripts/tmux-smoke.sh
 ```
 

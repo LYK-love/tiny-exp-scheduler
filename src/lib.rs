@@ -215,6 +215,7 @@ pub struct RunOptions {
     pub tick_seconds: u64,
     pub dry_run: bool,
     pub keep_job_tabs: bool,
+    pub verbose: bool,
 }
 
 impl Default for RunOptions {
@@ -227,6 +228,7 @@ impl Default for RunOptions {
             tick_seconds: 1,
             dry_run: false,
             keep_job_tabs: false,
+            verbose: false,
         }
     }
 }
@@ -316,6 +318,9 @@ fn parse_run_args(argv: &[String]) -> Result<CliAction, String> {
             "--keep-job-tabs" => {
                 options.keep_job_tabs = true;
             }
+            "--verbose" => {
+                options.verbose = true;
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("unknown option: {arg}\n\n{}", help_text()));
             }
@@ -357,6 +362,7 @@ OPTIONS:
   --tick-seconds N    Scheduler polling interval in seconds. Default: 1
   --dry-run           Resolve GPUs and print the plan without touching tmux.
   --keep-job-tabs     Keep finished job tabs open in tmux. Default: off
+  --verbose           Print per-job runtime events in the scheduler tab.
   -h, --help          Show this help message.
 
 CUDA DEVICES:
@@ -426,6 +432,7 @@ pub fn run(options: RunOptions) -> io::Result<()> {
         gpu_devices,
         commands,
         options.keep_job_tabs,
+        options.verbose,
     );
     scheduler.run_loop(Duration::from_secs(options.tick_seconds));
     println!();
@@ -644,6 +651,7 @@ pub struct Scheduler {
     device_ids: Vec<usize>,
     gpu_in_use: Vec<bool>,
     keep_job_tabs: bool,
+    verbose: bool,
 }
 
 impl Scheduler {
@@ -653,6 +661,7 @@ impl Scheduler {
         device_ids: Vec<usize>,
         commands: Vec<String>,
         keep_job_tabs: bool,
+        verbose: bool,
     ) -> Self {
         let jobs = commands
             .into_iter()
@@ -667,6 +676,7 @@ impl Scheduler {
             device_ids,
             gpu_in_use: vec![false; slots],
             keep_job_tabs,
+            verbose,
         }
     }
 
@@ -784,8 +794,21 @@ impl Scheduler {
     fn finish_running_job(&mut self, idx: usize) -> io::Result<()> {
         let exit_code = read_exit_code(&self.jobs[idx].exit_path)?;
         self.jobs[idx].status = map_exit_code(exit_code);
+        let status = self.jobs[idx].status.clone();
+        let window_name = self.jobs[idx]
+            .window_name
+            .clone()
+            .unwrap_or_else(|| self.jobs[idx].name());
         if let Some(gpu_id) = self.jobs[idx].gpu_id.take() {
             self.release_gpu(gpu_id);
+        }
+        if self.verbose {
+            println!(
+                "[FINISHED] {} -> {}{}",
+                window_name,
+                format_job_status(&status),
+                format_exit_code_suffix(exit_code)
+            );
         }
         Ok(())
     }
@@ -953,6 +976,24 @@ fn join_ids(ids: &[usize]) -> String {
         .join(", ")
 }
 
+fn format_job_status(status: &JobStatus) -> &'static str {
+    match status {
+        JobStatus::Pending => "Pending",
+        JobStatus::Scheduled => "Scheduled",
+        JobStatus::Running => "Running",
+        JobStatus::Done => "Done",
+        JobStatus::Failed => "Failed",
+        JobStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn format_exit_code_suffix(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!(" (exit={code})"),
+        None => String::new(),
+    }
+}
+
 pub fn shell_quote(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();
@@ -990,6 +1031,7 @@ mod tests {
             "96".to_string(),
             "--dry-run".to_string(),
             "--keep-job-tabs".to_string(),
+            "--verbose".to_string(),
         ];
         let parsed = parse_args(&args).unwrap();
         match parsed {
@@ -1000,6 +1042,7 @@ mod tests {
                 assert_eq!(options.idle_memory_threshold_mb, 96);
                 assert!(options.dry_run);
                 assert!(options.keep_job_tabs);
+                assert!(options.verbose);
             }
             _ => panic!("expected run action"),
         }
@@ -1015,6 +1058,7 @@ mod tests {
         assert!(help.contains("--dry-run"));
         assert!(help.contains("--idle-memory-threshold-mb"));
         assert!(help.contains("--keep-job-tabs"));
+        assert!(help.contains("--verbose"));
         assert!(help.contains("tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]"));
     }
 
@@ -1189,6 +1233,7 @@ mod tests {
             device_ids: vec![0, 1, 2],
             gpu_in_use: vec![false, false, false],
             keep_job_tabs: false,
+            verbose: false,
         };
 
         let summary = scheduler.summary();
@@ -1210,6 +1255,7 @@ mod tests {
             PathBuf::from("logs"),
             vec![3],
             vec!["python a.py".to_string(), "python b.py".to_string()],
+            false,
             false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
@@ -1238,6 +1284,7 @@ mod tests {
             vec![0],
             vec!["python train.py".to_string()],
             false,
+            false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
         scheduler.jobs[0].gpu_id = Some(0);
@@ -1259,6 +1306,7 @@ mod tests {
             logs_dir.clone(),
             vec![0],
             vec!["python train.py".to_string()],
+            false,
             false,
         );
         scheduler.jobs[0].status = JobStatus::Running;
@@ -1287,6 +1335,7 @@ mod tests {
             tick_seconds: 1,
             dry_run: true,
             keep_job_tabs: false,
+            verbose: false,
         };
         let summary = build_dry_run_summary(&options, &[0, 2], 4);
         assert!(summary.contains("===== Dry Run ====="));

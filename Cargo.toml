@@ -5,6 +5,6 @@ edition = "2021"
 description = "A minimal tmux + GPU task scheduler for single-machine experiments"
 license = "MIT"
 repository = "https://github.com/LYK-love/tiny-exp-scheduler"
-readme = "README.en.md"
+readme = "README.md"
 
 [dependencies]
