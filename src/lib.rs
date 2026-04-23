@@ -212,6 +212,7 @@ pub struct RunOptions {
     pub logs_dir: PathBuf,
     pub cuda_devices: CudaDevicesArg,
     pub idle_memory_threshold_mb: usize,
+    pub idle_utilization_threshold: usize,
     pub tick_seconds: u64,
     pub dry_run: bool,
     pub keep_job_tabs: bool,
@@ -225,6 +226,7 @@ impl Default for RunOptions {
             logs_dir: PathBuf::from("logs"),
             cuda_devices: CudaDevicesArg::Auto,
             idle_memory_threshold_mb: 64,
+            idle_utilization_threshold: 0,
             tick_seconds: 1,
             dry_run: false,
             keep_job_tabs: false,
@@ -305,6 +307,15 @@ fn parse_run_args(argv: &[String]) -> Result<CliAction, String> {
                     .parse::<usize>()
                     .map_err(|_| format!("invalid --idle-memory-threshold-mb value: {value}"))?;
             }
+            "--idle-utilization-threshold" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or("--idle-utilization-threshold requires a value")?;
+                options.idle_utilization_threshold = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --idle-utilization-threshold value: {value}"))?;
+            }
             "--tick-seconds" => {
                 i += 1;
                 let value = argv.get(i).ok_or("--tick-seconds requires a value")?;
@@ -359,6 +370,8 @@ OPTIONS:
                       Default: auto
   --idle-memory-threshold-mb N
                       Max memory.used for an idle GPU. Default: 64
+  --idle-utilization-threshold N
+                      Max utilization.gpu for an idle GPU. Default: 0
   --tick-seconds N    Scheduler polling interval in seconds. Default: 1
   --dry-run           Resolve GPUs and print the plan without touching tmux.
   --keep-job-tabs     Keep finished job tabs open in tmux. Default: off
@@ -369,7 +382,7 @@ CUDA DEVICES:
   auto                Detect idle GPUs once at startup and freeze that set.
   none                Do not allocate GPUs or set CUDA_VISIBLE_DEVICES.
   0,2,5               Use exactly these GPUs; all must already be idle.
-  idle rule           memory.used <= threshold and utilization.gpu == 0
+  idle rule           memory.used <= memory threshold and utilization.gpu <= utilization threshold
   startup output      Prints the final CUDA device range.
 
 INPUT RULES:
@@ -395,8 +408,11 @@ pub fn run(options: RunOptions) -> io::Result<()> {
         ));
     }
 
-    let gpu_devices =
-        resolve_cuda_devices(&options.cuda_devices, options.idle_memory_threshold_mb)?;
+    let gpu_devices = resolve_cuda_devices(
+        &options.cuda_devices,
+        options.idle_memory_threshold_mb,
+        options.idle_utilization_threshold,
+    )?;
     if !matches!(options.cuda_devices, CudaDevicesArg::None) && gpu_devices.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -424,7 +440,10 @@ pub fn run(options: RunOptions) -> io::Result<()> {
     println!("Scheduler tab: {SCHEDULER_WINDOW_NAME}");
     println!("Current tab renamed to {SCHEDULER_WINDOW_NAME}.");
     println!("Job tabs will be appended after it.");
-    println!("Final CUDA device range: {}", format_cuda_devices(&gpu_devices));
+    println!(
+        "Final CUDA device range: {}",
+        format_cuda_devices(&gpu_devices)
+    );
     println!("Logs dir: {}", options.logs_dir.display());
     let mut scheduler = Scheduler::new(
         session,
@@ -504,21 +523,29 @@ fn parse_cuda_devices_arg(value: &str) -> Result<CudaDevicesArg, String> {
 pub fn resolve_cuda_devices(
     selection: &CudaDevicesArg,
     idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
 ) -> io::Result<Vec<usize>> {
     match selection {
-        CudaDevicesArg::Auto => resolve_auto_cuda_devices(idle_memory_threshold_mb),
-        CudaDevicesArg::None => Ok(Vec::new()),
-        CudaDevicesArg::Explicit(devices) => {
-            validate_explicit_cuda_devices(devices, idle_memory_threshold_mb)
+        CudaDevicesArg::Auto => {
+            resolve_auto_cuda_devices(idle_memory_threshold_mb, idle_utilization_threshold)
         }
+        CudaDevicesArg::None => Ok(Vec::new()),
+        CudaDevicesArg::Explicit(devices) => validate_explicit_cuda_devices(
+            devices,
+            idle_memory_threshold_mb,
+            idle_utilization_threshold,
+        ),
     }
 }
 
-fn resolve_auto_cuda_devices(idle_memory_threshold_mb: usize) -> io::Result<Vec<usize>> {
+fn resolve_auto_cuda_devices(
+    idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
+) -> io::Result<Vec<usize>> {
     let snapshots = query_gpu_snapshots()?;
     let devices: Vec<usize> = snapshots
         .into_iter()
-        .filter(|gpu| is_gpu_idle(gpu, idle_memory_threshold_mb))
+        .filter(|gpu| is_gpu_idle(gpu, idle_memory_threshold_mb, idle_utilization_threshold))
         .map(|gpu| gpu.index)
         .collect();
 
@@ -535,6 +562,7 @@ fn resolve_auto_cuda_devices(idle_memory_threshold_mb: usize) -> io::Result<Vec<
 fn validate_explicit_cuda_devices(
     devices: &[usize],
     idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
 ) -> io::Result<Vec<usize>> {
     let snapshots = query_gpu_snapshots()?;
     let mut checked = Vec::new();
@@ -550,12 +578,19 @@ fn validate_explicit_cuda_devices(
                 )
             })?;
 
-        if !is_gpu_idle(snapshot, idle_memory_threshold_mb) {
+        if !is_gpu_idle(
+            snapshot,
+            idle_memory_threshold_mb,
+            idle_utilization_threshold,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "CUDA device {device} is busy (memory.used={} MiB, utilization.gpu={}%)",
-                    snapshot.memory_used_mb, snapshot.utilization_gpu
+                    "CUDA device {device} is busy (memory.used={} MiB, utilization.gpu={}%; thresholds: memory.used <= {} MiB, utilization.gpu <= {}%)",
+                    snapshot.memory_used_mb,
+                    snapshot.utilization_gpu,
+                    idle_memory_threshold_mb,
+                    idle_utilization_threshold
                 ),
             ));
         }
@@ -624,8 +659,13 @@ fn parse_gpu_snapshots(stdout: &[u8]) -> io::Result<Vec<GpuSnapshot>> {
     Ok(snapshots)
 }
 
-fn is_gpu_idle(snapshot: &GpuSnapshot, idle_memory_threshold_mb: usize) -> bool {
-    snapshot.memory_used_mb <= idle_memory_threshold_mb && snapshot.utilization_gpu == 0
+fn is_gpu_idle(
+    snapshot: &GpuSnapshot,
+    idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
+) -> bool {
+    snapshot.memory_used_mb <= idle_memory_threshold_mb
+        && snapshot.utilization_gpu <= idle_utilization_threshold
 }
 
 fn ensure_window_plan_absent(tmux: &TmuxClient, session: &str, job_count: usize) -> io::Result<()> {
@@ -858,6 +898,10 @@ fn build_dry_run_summary(options: &RunOptions, devices: &[usize], job_count: usi
         "Idle memory threshold: {} MiB",
         options.idle_memory_threshold_mb
     ));
+    lines.push(format!(
+        "Idle utilization threshold: {}%",
+        options.idle_utilization_threshold
+    ));
     lines.push(format!("Logs dir: {}", options.logs_dir.display()));
     lines.push("tmux was not touched".to_string());
     lines.join("\n")
@@ -1029,6 +1073,8 @@ mod tests {
             "0,2".to_string(),
             "--idle-memory-threshold-mb".to_string(),
             "96".to_string(),
+            "--idle-utilization-threshold".to_string(),
+            "25".to_string(),
             "--dry-run".to_string(),
             "--keep-job-tabs".to_string(),
             "--verbose".to_string(),
@@ -1040,6 +1086,7 @@ mod tests {
                 assert_eq!(options.logs_dir, PathBuf::from("artifacts"));
                 assert_eq!(options.cuda_devices, CudaDevicesArg::Explicit(vec![0, 2]));
                 assert_eq!(options.idle_memory_threshold_mb, 96);
+                assert_eq!(options.idle_utilization_threshold, 25);
                 assert!(options.dry_run);
                 assert!(options.keep_job_tabs);
                 assert!(options.verbose);
@@ -1057,6 +1104,7 @@ mod tests {
         assert!(help.contains("Detect idle GPUs once at startup"));
         assert!(help.contains("--dry-run"));
         assert!(help.contains("--idle-memory-threshold-mb"));
+        assert!(help.contains("--idle-utilization-threshold"));
         assert!(help.contains("--keep-job-tabs"));
         assert!(help.contains("--verbose"));
         assert!(help.contains("tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]"));
@@ -1152,7 +1200,8 @@ mod tests {
                 memory_used_mb: 64,
                 utilization_gpu: 0,
             },
-            64
+            64,
+            0
         ));
         assert!(!is_gpu_idle(
             &GpuSnapshot {
@@ -1160,7 +1209,8 @@ mod tests {
                 memory_used_mb: 65,
                 utilization_gpu: 0,
             },
-            64
+            64,
+            0
         ));
         assert!(!is_gpu_idle(
             &GpuSnapshot {
@@ -1168,7 +1218,8 @@ mod tests {
                 memory_used_mb: 32,
                 utilization_gpu: 1,
             },
-            64
+            64,
+            0
         ));
         assert!(is_gpu_idle(
             &GpuSnapshot {
@@ -1176,7 +1227,17 @@ mod tests {
                 memory_used_mb: 96,
                 utilization_gpu: 0,
             },
-            96
+            96,
+            0
+        ));
+        assert!(is_gpu_idle(
+            &GpuSnapshot {
+                index: 0,
+                memory_used_mb: 96,
+                utilization_gpu: 10,
+            },
+            96,
+            10
         ));
     }
 
@@ -1332,6 +1393,7 @@ mod tests {
             logs_dir: PathBuf::from("artifacts"),
             cuda_devices: CudaDevicesArg::Explicit(vec![0, 2]),
             idle_memory_threshold_mb: 96,
+            idle_utilization_threshold: 25,
             tick_seconds: 1,
             dry_run: true,
             keep_job_tabs: false,
@@ -1342,6 +1404,7 @@ mod tests {
         assert!(summary.contains("Jobs: 4"));
         assert!(summary.contains("CUDA devices: cuda:0,cuda:2"));
         assert!(summary.contains("Idle memory threshold: 96 MiB"));
+        assert!(summary.contains("Idle utilization threshold: 25%"));
         assert!(summary.contains("Logs dir: artifacts"));
     }
 

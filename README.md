@@ -68,6 +68,7 @@ Common options:
 - `--cuda-devices none`
 - `--cuda-devices 0,2,5`
 - `--idle-memory-threshold-mb N`
+- `--idle-utilization-threshold N`
 - `--logs-dir DIR`
 - `--keep-job-tabs`
 - `--verbose`

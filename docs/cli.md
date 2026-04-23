@@ -42,7 +42,7 @@ The current idle rule is:
 
 ```text
 memory.used <= N
-utilization.gpu == 0
+utilization.gpu <= idle utilization threshold
 ```
 
 Default:
@@ -50,6 +50,37 @@ Default:
 ```text
 64
 ```
+
+### `--idle-utilization-threshold N`
+
+Used only when GPU idleness is checked.
+
+The current idle rule is:
+
+```text
+memory.used <= idle memory threshold
+utilization.gpu <= N
+```
+
+Default:
+
+```text
+0
+```
+
+Example:
+
+```bash
+tiny-exp-scheduler run commands.txt \
+  --cuda-devices 0 \
+  --idle-memory-threshold-mb 5000 \
+  --idle-utilization-threshold 40
+```
+
+This accepts GPU 0 only if both conditions are true:
+
+- `memory.used <= 5000`
+- `utilization.gpu <= 40`
 
 ### `--logs-dir DIR`
 

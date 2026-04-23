@@ -217,10 +217,12 @@ The idle rule used by `auto` is:
 ```text
 memory.used <= threshold
 and
-utilization.gpu == 0
+utilization.gpu <= utilization_threshold
 ```
 
-The threshold is controlled by `--idle-memory-threshold-mb`.
+The memory threshold is controlled by `--idle-memory-threshold-mb`.
+The utilization threshold is controlled by `--idle-utilization-threshold`.
+Both conditions must be satisfied for a GPU to be treated as idle.
 
 ## 6. Job Workflow
 
