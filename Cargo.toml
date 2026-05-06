@@ -8,3 +8,4 @@ repository = "https://github.com/LYK-love/tiny-exp-scheduler"
 readme = "README.md"
 
 [dependencies]
+regex = "1"

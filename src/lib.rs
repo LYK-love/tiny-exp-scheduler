@@ -1,3 +1,4 @@
+use regex::Regex;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -47,6 +48,28 @@ impl TmuxClient {
             ));
         }
         Ok(session)
+    }
+
+    fn current_window_name(&self) -> io::Result<String> {
+        let output = Command::new("tmux")
+            .args(["display-message", "-p", "#{window_name}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to resolve current tmux window name",
+            ));
+        }
+        let window_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if window_name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "current tmux window name is empty",
+            ));
+        }
+        Ok(window_name)
     }
 
     fn rename_current_window(&self, name: &str) -> io::Result<()> {
@@ -433,7 +456,8 @@ pub fn run(options: RunOptions) -> io::Result<()> {
     fs::create_dir_all(&options.logs_dir)?;
 
     let session = tmux.current_session()?;
-    ensure_window_plan_absent(&tmux, &session, commands.len())?;
+    let current_window = tmux.current_window_name()?;
+    ensure_window_plan_absent(&tmux, &session, &current_window)?;
     tmux.rename_current_window(SCHEDULER_WINDOW_NAME)?;
 
     println!("Session: {session}");
@@ -668,9 +692,13 @@ fn is_gpu_idle(
         && snapshot.utilization_gpu <= idle_utilization_threshold
 }
 
-fn ensure_window_plan_absent(tmux: &TmuxClient, session: &str, job_count: usize) -> io::Result<()> {
+fn ensure_window_plan_absent(
+    tmux: &TmuxClient,
+    session: &str,
+    current_window: &str,
+) -> io::Result<()> {
     let windows = tmux.window_names(session)?;
-    let conflicts = find_window_conflicts(&windows, job_count);
+    let conflicts = find_window_conflicts(&windows, current_window);
     if conflicts.is_empty() {
         Ok(())
     } else {
@@ -907,17 +935,34 @@ fn build_dry_run_summary(options: &RunOptions, devices: &[usize], job_count: usi
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn planned_window_names(job_count: usize) -> Vec<String> {
     std::iter::once(SCHEDULER_WINDOW_NAME.to_string())
         .chain((1..=job_count).map(|id| format!("job_{id}")))
         .collect()
 }
 
-fn find_window_conflicts(existing_windows: &[String], job_count: usize) -> Vec<String> {
-    planned_window_names(job_count)
-        .into_iter()
-        .filter(|name| existing_windows.iter().any(|existing| existing == name))
-        .collect()
+fn find_window_conflicts(existing_windows: &[String], current_window: &str) -> Vec<String> {
+    let job_window = Regex::new(r"^job_[0-9]+$").expect("job window regex should compile");
+    let scheduler_window_count = existing_windows
+        .iter()
+        .filter(|existing| existing.as_str() == SCHEDULER_WINDOW_NAME)
+        .count();
+    let mut conflicts = Vec::new();
+
+    for window in existing_windows {
+        let is_conflict = if window.as_str() == SCHEDULER_WINDOW_NAME {
+            current_window != SCHEDULER_WINDOW_NAME || scheduler_window_count > 1
+        } else {
+            job_window.is_match(window)
+        };
+
+        if is_conflict && !conflicts.contains(window) {
+            conflicts.push(window.clone());
+        }
+    }
+
+    conflicts
 }
 
 fn ensure_job_window_absent(tmux: &TmuxClient, session: &str, window_name: &str) -> io::Result<()> {
@@ -1415,11 +1460,54 @@ mod tests {
             "__sched__".to_string(),
             "job_2".to_string(),
         ];
-        let conflicts = find_window_conflicts(&existing, 3);
+        let conflicts = find_window_conflicts(&existing, "shell");
         assert_eq!(
             conflicts,
             vec!["__sched__".to_string(), "job_2".to_string()]
         );
+    }
+
+    #[test]
+    fn find_window_conflicts_allows_current_scheduler_window() {
+        let existing = vec!["__sched__".to_string(), "shell".to_string()];
+        let conflicts = find_window_conflicts(&existing, "__sched__");
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn find_window_conflicts_rejects_duplicate_scheduler_window() {
+        let existing = vec![
+            "__sched__".to_string(),
+            "shell".to_string(),
+            "__sched__".to_string(),
+        ];
+        let conflicts = find_window_conflicts(&existing, "__sched__");
+        assert_eq!(conflicts, vec!["__sched__".to_string()]);
+    }
+
+    #[test]
+    fn find_window_conflicts_still_rejects_job_tabs_from_current_scheduler_window() {
+        let existing = vec!["__sched__".to_string(), "job_1".to_string()];
+        let conflicts = find_window_conflicts(&existing, "__sched__");
+        assert_eq!(conflicts, vec!["job_1".to_string()]);
+    }
+
+    #[test]
+    fn find_window_conflicts_rejects_any_regex_job_tab() {
+        let existing = vec!["shell".to_string(), "job_99".to_string()];
+        let conflicts = find_window_conflicts(&existing, "shell");
+        assert_eq!(conflicts, vec!["job_99".to_string()]);
+    }
+
+    #[test]
+    fn find_window_conflicts_ignores_job_like_non_matches() {
+        let existing = vec![
+            "job_1_old".to_string(),
+            "my_job_1".to_string(),
+            "job_alpha".to_string(),
+        ];
+        let conflicts = find_window_conflicts(&existing, "shell");
+        assert!(conflicts.is_empty());
     }
 
     #[test]
