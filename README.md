@@ -46,7 +46,7 @@ python train.py --exp exp_b
 Run the scheduler:
 
 ```bash
-tiny-exp-scheduler run commands.txt --cuda-devices auto
+tiny-exp-scheduler run commands.txt --cuda-devices auto --verbose
 ```
 
 ## Usage
@@ -74,6 +74,10 @@ Common options:
 - `--verbose`
 - `--tick-seconds N`
 - `--dry-run`
+
+Recommended default:
+
+- enable `--verbose` unless you specifically want a quieter scheduler tab
 
 For a full option reference, see [CLI reference](docs/cli.md). For runtime semantics and state transitions, see the [design document](docs/design.md). For representative end-to-end usage patterns, see [workflow demos](docs/workflows.md).
 
@@ -151,6 +155,9 @@ logs/
 ```
 
 The scheduler keeps a summary window named `__sched__` in the current *tmux* session.
+
+By default, that summary includes the total job count, plus the final counts for `Done`,
+`Failed`, and `Cancelled`.
 
 Jobs may still write their own logs, checkpoints, or output files elsewhere; those are not redirected into the scheduler log files. Scheduler logging only captures the command's stdout and stderr.
 
