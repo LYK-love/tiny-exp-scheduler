@@ -36,7 +36,7 @@ python train.py --exp exp_b
 Start the scheduler:
 
 ```bash
-tiny-exp-scheduler run commands.txt --cuda-devices auto
+tiny-exp-scheduler run commands.txt --cuda-devices auto --verbose
 ```
 
 ## Command Format
@@ -50,6 +50,19 @@ python train.py --exp exp_b
 ```
 
 ## GPU Selection
+=======
+If `COMMANDS_FILE` is omitted, the scheduler reads from standard input.
+
+Common options:
+
+- `--cuda-devices auto`
+- `--cuda-devices none`
+- `--cuda-devices 0,2,5`
+- `--idle-memory-threshold-mb N`
+- `--idle-utilization-threshold N`
+- `--logs-dir DIR`
+- `--keep-job-tabs`
+- `--verbose`
 
 ```bash
 tiny-exp-scheduler run commands.txt --cuda-devices auto
@@ -93,14 +106,6 @@ logs/
   job_2.exit
 ```
 
-Useful options:
-
-```bash
---logs-dir DIR
---keep-job-tabs
---verbose
---dry-run
-```
 
 ## Docs
 
