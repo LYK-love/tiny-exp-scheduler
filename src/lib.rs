@@ -577,7 +577,10 @@ fn resolve_auto_cuda_devices(
     if devices.is_empty() {
         Err(io::Error::new(
             io::ErrorKind::Other,
-            "auto mode found no idle CUDA devices",
+            format!(
+                "auto mode found no idle CUDA devices\n\n{}",
+                idle_threshold_help(idle_memory_threshold_mb, idle_utilization_threshold)
+            ),
         ))
     } else {
         Ok(devices)
@@ -610,12 +613,11 @@ fn validate_explicit_cuda_devices(
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "CUDA device {device} is busy (memory.used={} MiB, utilization.gpu={}%; thresholds: memory.used <= {} MiB, utilization.gpu <= {}%)",
-                    snapshot.memory_used_mb,
-                    snapshot.utilization_gpu,
+                busy_cuda_device_message(
+                    *device,
+                    snapshot,
                     idle_memory_threshold_mb,
-                    idle_utilization_threshold
+                    idle_utilization_threshold,
                 ),
             ));
         }
@@ -691,6 +693,33 @@ fn is_gpu_idle(
 ) -> bool {
     snapshot.memory_used_mb <= idle_memory_threshold_mb
         && snapshot.utilization_gpu <= idle_utilization_threshold
+}
+
+fn busy_cuda_device_message(
+    device: usize,
+    snapshot: &GpuSnapshot,
+    idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
+) -> String {
+    format!(
+        "CUDA device {device} is busy (memory.used={} MiB, utilization.gpu={}%; thresholds: memory.used <= {} MiB, utilization.gpu <= {}%)\n\n{}\nThis GPU would pass the current check with --idle-memory-threshold-mb {} --idle-utilization-threshold {}.",
+        snapshot.memory_used_mb,
+        snapshot.utilization_gpu,
+        idle_memory_threshold_mb,
+        idle_utilization_threshold,
+        idle_threshold_help(idle_memory_threshold_mb, idle_utilization_threshold),
+        snapshot.memory_used_mb,
+        snapshot.utilization_gpu
+    )
+}
+
+fn idle_threshold_help(
+    idle_memory_threshold_mb: usize,
+    idle_utilization_threshold: usize,
+) -> String {
+    format!(
+        "GPU idleness is checked before jobs start:\n  --idle-memory-threshold-mb N       allow a GPU only when memory.used <= N MiB (current: {idle_memory_threshold_mb})\n  --idle-utilization-threshold N     allow a GPU only when utilization.gpu <= N% (current: {idle_utilization_threshold})\n\nIf the memory is expected, for example from a harmless display process or cached context, you can relax the check:\n  --idle-memory-threshold-mb 5000 \\\n  --idle-utilization-threshold 40\n\nOnly relax these thresholds when you are sure the existing GPU activity will not conflict with your jobs."
+    )
 }
 
 fn ensure_window_plan_absent(
@@ -1285,6 +1314,27 @@ mod tests {
             96,
             10
         ));
+    }
+
+    #[test]
+    fn busy_cuda_device_message_explains_idle_thresholds() {
+        let message = busy_cuda_device_message(
+            0,
+            &GpuSnapshot {
+                index: 0,
+                memory_used_mb: 4484,
+                utilization_gpu: 0,
+            },
+            64,
+            0,
+        );
+
+        assert!(message.contains("CUDA device 0 is busy"));
+        assert!(message.contains("--idle-memory-threshold-mb 5000"));
+        assert!(message.contains("--idle-utilization-threshold 40"));
+        assert!(message.contains("allow a GPU only when memory.used <= N MiB"));
+        assert!(message.contains("allow a GPU only when utilization.gpu <= N%"));
+        assert!(message.contains("--idle-memory-threshold-mb 4484 --idle-utilization-threshold 0"));
     }
 
     #[test]

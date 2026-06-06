@@ -1,26 +1,16 @@
 # tiny-exp-scheduler
 
-> You can use AI to translate or explain this document and the rest of the project's documentation in your preferred language.
->
-> 你可以使用 AI 将本文档和本项目的其他文档翻译成你偏好的语言，或为你解读其中的内容。
+Minimal `tmux` scheduler for running one-line experiment commands on selected CUDA GPUs.
 
-`tiny-exp-scheduler` is a minimal [*tmux*](https://github.com/tmux/tmux/wiki)-based scheduler for single-GPU deep learning jobs on a single multi-GPU machine.
+It reads a plain text command list, starts jobs in separate `tmux` windows, assigns one GPU per running job by setting `CUDA_VISIBLE_DEVICES`, and writes scheduler-managed logs plus exit codes.
 
-Each experiment is a one-line shell command, called a *job*. The scheduler reads a list of jobs, assigns available GPUs, launches them in parallel in separate *tmux* windows, and records logs and exit status.
-
-It introduces no extra abstractions and no domain-specific language (DSL): everything is plain shell commands and classic Linux tools. By default, each job occupies one GPU; a `none` mode is also available for jobs that should not receive any CUDA allocation.
-
-> I'll consider supporting multi-GPU experiments in future :)
-
-## Installation
+## Install
 
 Requirements:
 
 - Rust 1.74+
 - `tmux`
 - `nvidia-smi`
-
-Install from source:
 
 ```bash
 git clone https://github.com/LYK-love/tiny-exp-scheduler.git
@@ -30,36 +20,37 @@ cargo install --path .
 
 ## Quick Start
 
-Start a `tmux` session:
+Run inside an existing `tmux` session:
 
 ```bash
 tmux new-session -s exp
 ```
 
-Prepare `commands.txt`:
+Create `commands.txt`:
 
 ```text
 python train.py --exp exp_a
 python train.py --exp exp_b
 ```
 
-Run the scheduler:
+Start the scheduler:
 
 ```bash
 tiny-exp-scheduler run commands.txt --cuda-devices auto --verbose
 ```
 
-## Usage
+## Command Format
 
-Run the scheduler inside an existing *tmux* session.
+The input file is not a shell script. The scheduler treats each non-empty, non-comment line as one job:
 
-```bash
-tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]
-
-# Or:
-cat commands.txt | tiny-exp-scheduler run [OPTIONS]
+```text
+# ignored
+python train.py --exp exp_a
+python train.py --exp exp_b
 ```
 
+## GPU Selection
+=======
 If `COMMANDS_FILE` is omitted, the scheduler reads from standard input.
 
 Common options:
@@ -72,79 +63,40 @@ Common options:
 - `--logs-dir DIR`
 - `--keep-job-tabs`
 - `--verbose`
-- `--tick-seconds N`
-- `--dry-run`
-
-Recommended default:
-
-- enable `--verbose` unless you specifically want a quieter scheduler tab
-
-For a full option reference, see [CLI reference](docs/cli.md). For runtime semantics and state transitions, see the [design document](docs/design.md). For representative end-to-end usage patterns, see [workflow demos](docs/workflows.md).
-
-## Command File Format
-
-The command file is conventionally named `commands.txt`. It uses shell-like command syntax。
-
-> Remember that this project does not define a DSL. Everything here is just shell.
-
-The `.txt` suffix is intentional: it emphasizes that the file is meant to be read by the scheduler, not executed directly as a `.sh` script.
-
-The scheduler parses the file as a list of commands rather than running it as a shell script.
-
-Input rules:
-
-- ignore empty lines
-- ignore lines starting with `#`
-- treat each remaining line as one *job*
-
-## Recommended Pattern
-
-Keep each input line as one shell command, and let that command invoke one wrapper script.
-
-Put shared environment setup in the wrapper script, for example environment activation, common exports, and the final command invocation. Let the scheduler set `CUDA_VISIBLE_DEVICES` from the outside.
-
-If you use `--cuda-devices none`, the scheduler does not set `CUDA_VISIBLE_DEVICES` at all.
-
-Example `commands.txt`:
-
-```text
-bash scripts/train_one.sh exp_a configs/pong_a.yaml data/pong
-bash scripts/train_one.sh exp_b configs/pong_b.yaml data/pong
-bash scripts/train_one.sh exp_c configs/pong_c.yaml data/pong
-bash scripts/train_one.sh exp_d configs/pong_d.yaml data/pong
-```
-
-Example wrapper script:
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${CONDA_ENV_NAME:=ml}"
-
-if ! command -v conda >/dev/null 2>&1; then
-  echo "[ERROR] conda was not found in PATH." >&2
-  exit 1
-fi
-
-CONDA_BASE="$(conda info --base)"
-# shellcheck source=/dev/null
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${CONDA_ENV_NAME}"
-
-RUN_NAME="$1"
-CONFIG_PATH="$2"
-DATASET_PATH="$3"
-
-python src/main.py \
-  --config "${CONFIG_PATH}" \
-  --dataset-path "${DATASET_PATH}" \
-  --run-name "${RUN_NAME}"
+tiny-exp-scheduler run commands.txt --cuda-devices auto
+tiny-exp-scheduler run commands.txt --cuda-devices 0,2,5
+tiny-exp-scheduler run commands.txt --cuda-devices none
 ```
 
-## Output
+- `auto`: detect idle GPUs once at startup.
+- `0,2,5`: use exactly these GPUs; each must pass the idle check.
+- `none`: do not set `CUDA_VISIBLE_DEVICES`.
 
-Default scheduler output:
+Idle means both checks pass:
+
+```text
+memory.used <= --idle-memory-threshold-mb
+utilization.gpu <= --idle-utilization-threshold
+```
+
+Defaults are strict: `64 MiB` and `0%`.
+
+If a GPU has expected background memory or light utilization, relax the startup check:
+
+```bash
+tiny-exp-scheduler run commands.txt \
+  --cuda-devices 0 \
+  --idle-memory-threshold-mb 5000 \
+  --idle-utilization-threshold 40
+```
+
+These options only decide whether a GPU is accepted as available. They do not free VRAM or stop other processes.
+
+## Logs
+
+Default output:
 
 ```text
 logs/
@@ -154,28 +106,18 @@ logs/
   job_2.exit
 ```
 
-The scheduler keeps a summary window named `__sched__` in the current *tmux* session.
 
-By default, that summary includes the total job count, plus the final counts for `Done`,
-`Failed`, and `Cancelled`.
-
-Jobs may still write their own logs, checkpoints, or output files elsewhere; those are not redirected into the scheduler log files. Scheduler logging only captures the command's stdout and stderr.
-
-## More
+## Docs
 
 - [CLI reference](docs/cli.md)
 - [workflow demos](docs/workflows.md)
-- [design document](docs/design.md)
-- [examples](./examples)：
-  * [examples/torch_hold_gpu.py](examples/torch_hold_gpu.py)
-  * [examples/torch-two-gpu-jobs.txt](examples/torch-two-gpu-jobs.txt)
-  * [examples/torch-four-gpu-jobs.txt](examples/torch-four-gpu-jobs.txt)
+- [design notes](docs/design.md)
+- [examples](examples)
 
-## Tests
+## Test
 
 ```bash
 cargo test
-
 bash scripts/tmux-smoke.sh
 ```
 
