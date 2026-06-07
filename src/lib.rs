@@ -469,7 +469,7 @@ pub fn run(options: RunOptions) -> io::Result<()> {
         format_cuda_devices(&gpu_devices)
     );
     println!("Logs dir: {}", options.logs_dir.display());
-    println!("Total jobs: {}", commands.len());
+    println!("{} jobs in total.", commands.len());
     let mut scheduler = Scheduler::new(
         session,
         options.logs_dir,
