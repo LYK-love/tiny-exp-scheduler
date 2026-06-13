@@ -102,6 +102,80 @@ logs/
   job_2.exit
 ```
 
+### `--scheduler-name NAME`
+
+Use a stable tmux namespace for this scheduler run.
+
+Rules:
+
+- `NAME` may contain ASCII letters, digits, `_`, `-`, and `.`
+- scheduler tab: `__sched_NAME__`
+- job tabs: `NAME_job_1`, `NAME_job_2`, ...
+
+If omitted, the scheduler chooses the first available namespace in the current tmux session. The first default run uses `__sched__` and `job_1`; later concurrent runs use names such as `__sched_2__` and `sched_2_job_1`.
+
+### `--cpu-threads N`
+
+Limit CPU compute threads per running job.
+
+See [CPU resource scheduling](cpu.md) for machine inspection commands and tuning guidance.
+
+The scheduler sets these environment variables for each job:
+
+- `OMP_NUM_THREADS`
+- `MKL_NUM_THREADS`
+- `OPENBLAS_NUM_THREADS`
+- `NUMEXPR_NUM_THREADS`
+- `VECLIB_MAXIMUM_THREADS`
+- `BLIS_NUM_THREADS`
+- `DIAMOND_TORCH_NUM_THREADS`
+- `DIAMOND_TORCH_INTEROP_THREADS=1`
+
+This is useful when several GPU jobs run concurrently and each job otherwise oversubscribes CPU cores.
+
+If CPU affinity is also enabled with `--cpu-cores` and `--cpus-per-job`, this value defaults to `--cpus-per-job` when `--cpu-threads` is omitted.
+
+### `--cpu-cores ARG`
+
+Select the CPU core pool for scheduler-managed affinity.
+
+See [CPU resource scheduling](cpu.md) for examples and CPU topology commands.
+
+Supported values:
+
+- `none`
+  Do not allocate CPU core slots. This is the default.
+- `auto`
+  Use all logical CPU cores reported by the OS.
+- `0-15,32-47`
+  Use exactly these logical CPU cores. Comma-separated core IDs and inclusive ranges are both supported.
+
+When this option is not `none`, `--cpus-per-job` is required.
+
+### `--cpus-per-job N`
+
+Split the CPU core pool into fixed-size slots and allocate one slot per running job.
+
+Example:
+
+```bash
+tiny-exp-scheduler run commands.txt \
+  --cuda-devices 0,1,2,3 \
+  --cpu-cores 0-31 \
+  --cpus-per-job 8
+```
+
+This creates four CPU slots:
+
+```text
+0,1,2,3,4,5,6,7
+8,9,10,11,12,13,14,15
+16,17,18,19,20,21,22,23
+24,25,26,27,28,29,30,31
+```
+
+Each job is launched through `taskset -c <slot> bash -lc '<command>'`, so subprocesses inherit the affinity.
+
 ### `--keep-job-tabs`
 
 Keep finished job tabs visible in `tmux`.
@@ -116,7 +190,7 @@ With `--keep-job-tabs`:
 
 ### `--verbose`
 
-Print per-job runtime events in the `__sched__` tab.
+Print per-job runtime events in the scheduler tab.
 
 This is mainly useful when you want to watch jobs finish in real time.
 

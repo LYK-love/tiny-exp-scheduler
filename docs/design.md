@@ -9,6 +9,7 @@ Start with [README.md](../README.md) for installation and basic usage. See
 
 Its default resource model is one running job per GPU. That makes it primarily a scheduler for
 single-GPU jobs, with an explicit `none` mode for jobs that should not receive any CUDA allocation.
+Optionally, it can also allocate fixed CPU core slots and launch jobs under `taskset`.
 
 At a high level, the tool does four things:
 
@@ -45,6 +46,7 @@ The scheduler core owns:
 - the pending-job queue
 - the running-job set
 - the fixed GPU pool for this run
+- the optional fixed CPU core slot pool for this run
 - the main scheduling loop
 
 Its job is to map pending *job*s onto available GPUs and to track state transitions until completion.
@@ -55,8 +57,8 @@ The scheduler runs inside an existing `tmux` session.
 
 Within that session:
 
-- the current tab is renamed to `__sched__`
-- each running *job* gets one new tab
+- the current tab is renamed to an available scheduler tab, such as `__sched__`
+- each running *job* gets one new tab in that scheduler's namespace
 - each job tab contains one pane
 - that pane runs one shell command
 
@@ -72,6 +74,11 @@ __sched__
     +--> job_2
     +--> job_3
     +--> ...
+
+__sched_2__
+    |
+    +--> sched_2_job_1
+    +--> sched_2_job_2
 ```
 
 ### Layer 4: Job Execution
@@ -137,12 +144,13 @@ At startup, the scheduler:
 2. reads jobs from file or stdin
 3. resolves the GPU set for this run
 4. validates startup conditions
-5. renames the current tab to `__sched__`
+5. resolves a tmux namespace for this run
+6. renames the current tab to that scheduler tab
 
 Startup rejects invalid states such as:
 
 - not running inside `tmux`
-- `__sched__` already existing in the current session
+- requested scheduler or job tab names already existing in the current session
 - no usable GPU under the requested mode
 - an explicitly requested GPU already being busy
 
@@ -154,11 +162,12 @@ Each iteration does the following:
 
 ```text
 1. find free GPUs inside the fixed GPU pool
-2. assign pending jobs to those GPUs
-3. launch newly assigned jobs in tmux tabs
-4. check running jobs for completion
-5. reclaim GPUs from finished jobs
-6. sleep until the next tick
+2. find free CPU slots inside the fixed CPU pool, if enabled
+3. assign pending jobs only when all requested resources are available
+4. launch newly assigned jobs in tmux tabs
+5. check running jobs for completion
+6. reclaim GPUs and CPU slots from finished jobs
+7. sleep until the next tick
 ```
 
 This loop continues until no pending or running jobs remain.
@@ -168,8 +177,8 @@ This loop continues until no pending or running jobs remain.
 When all jobs are done, the scheduler:
 
 1. computes final job states
-2. prints the summary in `__sched__`
-3. keeps the `__sched__` tab open
+2. prints the summary in the scheduler tab
+3. keeps the scheduler tab open
 
 Finished job tabs either disappear immediately or remain visible, depending on `--keep-job-tabs`.
 
@@ -224,7 +233,24 @@ The memory threshold is controlled by `--idle-memory-threshold-mb`.
 The utilization threshold is controlled by `--idle-utilization-threshold`.
 Both conditions must be satisfied for a GPU to be treated as idle.
 
-## 6. Job Workflow
+## 6. CPU Workflow
+
+CPU allocation is disabled by default. When enabled, the scheduler treats CPU cores as fixed-size slots.
+
+```text
+--cpu-cores 0-31
+--cpus-per-job 8
+```
+
+This creates slots `0-7`, `8-15`, `16-23`, and `24-31`. A pending job starts only when a CPU slot is free. The launched command is wrapped as:
+
+```text
+taskset -c <slot> bash -lc '<raw command>'
+```
+
+The affinity applies to the command's subprocesses, including PyTorch DataLoader workers. The scheduler also sets common OpenMP/BLAS/PyTorch thread environment variables. If `--cpu-threads` is omitted, the thread count defaults to `--cpus-per-job`; otherwise `--cpu-threads` overrides it.
+
+## 7. Job Workflow
 
 Each job has two kinds of states:
 
@@ -283,17 +309,19 @@ Once a job reaches `Finished`, the scheduler derives its final result as follows
 
 So `Done`, `Failed`, and `Cancelled` are not parallel to `Running`; they are final classifications assigned after `Finished`.
 
-## 7. tmux Workflow
+## 8. tmux Workflow
 
 The scheduler uses `tmux` as the runtime container and as part of job-state detection.
 
 ### Scheduler tab
 
-The current tab becomes `__sched__`. It hosts the control loop and the final summary.
+The current tab becomes a scheduler tab. The first default scheduler uses `__sched__`; additional default schedulers in the same tmux session use names such as `__sched_2__`. With `--scheduler-name NAME`, the scheduler tab is `__sched_NAME__`.
+
+The scheduler tab hosts the control loop and the final summary.
 
 ### Job tabs
 
-Each launched job gets one tab named `job_X`.
+Each launched job gets one tab in the scheduler namespace. The first default scheduler uses `job_X`; additional default schedulers use names such as `sched_2_job_X`. With `--scheduler-name NAME`, jobs use `NAME_job_X`.
 
 Each job tab contains one pane, and that pane runs one command.
 
@@ -330,7 +358,7 @@ With `--keep-job-tabs`:
 
 This means tab visibility and job liveness are not the same thing: with `--keep-job-tabs`, a tab may remain visible even though the job is no longer running.
 
-## 8. Command Materialization
+## 9. Command Materialization
 
 The scheduler does not interpret job semantics, but it does materialize each raw command into a concrete runtime form.
 
@@ -348,7 +376,7 @@ scheduler env + raw shell command + stdout/stderr capture + exit capture
 
 This is the only place where the scheduler wraps the user command.
 
-## 9. Status and Output Model
+## 10. Status and Output Model
 
 The default output shape is:
 
@@ -369,7 +397,7 @@ Final state is derived as follows:
 
 So the scheduler uses both process-exit information and `tmux` runtime state.
 
-## 10. Interrupt Workflow
+## 11. Interrupt Workflow
 
 Interrupts enter the system through `tmux` or through process exit.
 

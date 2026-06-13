@@ -1,4 +1,3 @@
-use regex::Regex;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
@@ -7,7 +6,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const SCHEDULER_WINDOW_NAME: &str = "__sched__";
+const DEFAULT_SCHEDULER_WINDOW_NAME: &str = "__sched__";
+const DEFAULT_JOB_WINDOW_PREFIX: &str = "job";
+const AUTO_SCHEDULER_WINDOW_PREFIX: &str = "__sched_";
+const AUTO_SCHEDULER_WINDOW_SUFFIX: &str = "__";
 
 struct TmuxClient;
 
@@ -205,6 +207,7 @@ pub struct Job {
     pub cmd: String,
     pub status: JobStatus,
     pub gpu_id: Option<usize>,
+    pub cpu_cores: Option<Vec<usize>>,
     pub window_name: Option<String>,
     pub log_path: PathBuf,
     pub exit_path: PathBuf,
@@ -218,6 +221,7 @@ impl Job {
             cmd,
             status: JobStatus::Pending,
             gpu_id: None,
+            cpu_cores: None,
             window_name: None,
             log_path: logs_dir.join(format!("{base}.log")),
             exit_path: logs_dir.join(format!("{base}.exit")),
@@ -233,6 +237,10 @@ impl Job {
 pub struct RunOptions {
     pub input_path: Option<PathBuf>,
     pub logs_dir: PathBuf,
+    pub scheduler_name: Option<String>,
+    pub cpu_threads: Option<usize>,
+    pub cpu_cores: CpuCoresArg,
+    pub cpus_per_job: Option<usize>,
     pub cuda_devices: CudaDevicesArg,
     pub idle_memory_threshold_mb: usize,
     pub idle_utilization_threshold: usize,
@@ -247,6 +255,10 @@ impl Default for RunOptions {
         Self {
             input_path: None,
             logs_dir: PathBuf::from("logs"),
+            scheduler_name: None,
+            cpu_threads: None,
+            cpu_cores: CpuCoresArg::None,
+            cpus_per_job: None,
             cuda_devices: CudaDevicesArg::Auto,
             idle_memory_threshold_mb: 64,
             idle_utilization_threshold: 0,
@@ -263,6 +275,19 @@ pub enum CudaDevicesArg {
     Auto,
     None,
     Explicit(Vec<usize>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CpuCoresArg {
+    None,
+    Auto,
+    Explicit(Vec<usize>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunNamespace {
+    scheduler_window_name: String,
+    job_window_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +340,26 @@ fn parse_run_args(argv: &[String]) -> Result<CliAction, String> {
                 i += 1;
                 let value = argv.get(i).ok_or("--logs-dir requires a value")?;
                 options.logs_dir = PathBuf::from(value);
+            }
+            "--scheduler-name" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--scheduler-name requires a value")?;
+                options.scheduler_name = Some(parse_scheduler_name_arg(value)?);
+            }
+            "--cpu-threads" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--cpu-threads requires a value")?;
+                options.cpu_threads = Some(parse_positive_usize_arg("--cpu-threads", value)?);
+            }
+            "--cpu-cores" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--cpu-cores requires a value")?;
+                options.cpu_cores = parse_cpu_cores_arg(value)?;
+            }
+            "--cpus-per-job" => {
+                i += 1;
+                let value = argv.get(i).ok_or("--cpus-per-job requires a value")?;
+                options.cpus_per_job = Some(parse_positive_usize_arg("--cpus-per-job", value)?);
             }
             "--cuda-devices" => {
                 i += 1;
@@ -383,12 +428,22 @@ USAGE:
 
 MODEL:
   Run inside an existing tmux session.
-  The current tab becomes __sched__.
+  The current tab becomes an available scheduler tab, such as __sched__.
   Job tabs are appended after it.
   The scheduler tab stays open for the final summary.
 
 OPTIONS:
   --logs-dir DIR      Directory for log and exit-code files. Default: logs
+  --scheduler-name NAME
+                      Stable tmux namespace for this run. Window: __sched_NAME__.
+                      Jobs: NAME_job_1, NAME_job_2, ...
+  --cpu-threads N     Limit CPU compute threads per job by setting common
+                      OpenMP/BLAS/PyTorch environment variables.
+  --cpu-cores ARG     CPU core pool for affinity allocation: 'auto', 'none',
+                      or a comma-separated list/range like 0-15,32-47.
+                      Default: none
+  --cpus-per-job N    Number of CPU cores to allocate per running job.
+                      Required for --cpu-cores auto.
   --cuda-devices ARG  'auto', 'none', or a comma-separated list like 0,2,5.
                       Default: auto
   --idle-memory-threshold-mb N
@@ -407,6 +462,13 @@ CUDA DEVICES:
   0,2,5               Use exactly these GPUs; all must already be idle.
   idle rule           memory.used <= memory threshold and utilization.gpu <= utilization threshold
   startup output      Prints the final CUDA device range.
+
+CPU CORES:
+  none                Do not allocate CPU affinity slots.
+  auto                Use all logical CPU cores, split by --cpus-per-job.
+  0-15,32-47          Use exactly these logical CPU cores.
+  --cpus-per-job N    Split the CPU pool into fixed-size slots.
+  thread limit        If --cpu-threads is omitted, each CPU slot uses N threads.
 
 INPUT RULES:
   - ignore empty lines
@@ -436,6 +498,7 @@ pub fn run(options: RunOptions) -> io::Result<()> {
         options.idle_memory_threshold_mb,
         options.idle_utilization_threshold,
     )?;
+    let cpu_slots = resolve_cpu_slots(&options.cpu_cores, options.cpus_per_job)?;
     if !matches!(options.cuda_devices, CudaDevicesArg::None) && gpu_devices.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -446,35 +509,58 @@ pub fn run(options: RunOptions) -> io::Result<()> {
     if options.dry_run {
         println!(
             "{}",
-            build_dry_run_summary(&options, &gpu_devices, commands.len())
+            build_dry_run_summary(&options, &gpu_devices, &cpu_slots, commands.len())
         );
         return Ok(());
     }
 
     tmux.ensure_available()?;
+    if !cpu_slots.is_empty() {
+        ensure_taskset_available()?;
+    }
     ensure_running_inside_tmux()?;
     fs::create_dir_all(&options.logs_dir)?;
 
     let session = tmux.current_session()?;
     let current_window = tmux.current_window_name()?;
-    ensure_window_plan_absent(&tmux, &session, &current_window)?;
-    tmux.rename_current_window(SCHEDULER_WINDOW_NAME)?;
+    let namespace = resolve_run_namespace(
+        &tmux,
+        &session,
+        &current_window,
+        options.scheduler_name.as_deref(),
+        commands.len(),
+    )?;
+    tmux.rename_current_window(&namespace.scheduler_window_name)?;
 
     println!("Session: {session}");
-    println!("Scheduler tab: {SCHEDULER_WINDOW_NAME}");
-    println!("Current tab renamed to {SCHEDULER_WINDOW_NAME}.");
+    println!("Scheduler tab: {}", namespace.scheduler_window_name);
+    println!(
+        "Current tab renamed to {}.",
+        namespace.scheduler_window_name
+    );
     println!("Job tabs will be appended after it.");
     println!(
         "Final CUDA device range: {}",
         format_cuda_devices(&gpu_devices)
     );
+    println!(
+        "CPU threads per job: {}",
+        format_cpu_threads(effective_cpu_threads(
+            options.cpu_threads,
+            options.cpus_per_job
+        ))
+    );
+    println!("CPU slots: {}", format_cpu_slots(&cpu_slots));
     println!("Logs dir: {}", options.logs_dir.display());
     println!("{} jobs in total.", commands.len());
     let mut scheduler = Scheduler::new(
         session,
         options.logs_dir,
         gpu_devices,
+        cpu_slots,
         commands,
+        namespace.job_window_prefix,
+        options.cpu_threads,
         options.keep_job_tabs,
         options.verbose,
     );
@@ -516,6 +602,26 @@ fn ensure_running_inside_tmux() -> io::Result<()> {
     }
 }
 
+fn ensure_taskset_available() -> io::Result<()> {
+    let status = Command::new("taskset")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "taskset is required when --cpu-cores is enabled",
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "taskset is required when --cpu-cores is enabled",
+        )),
+        Err(err) => Err(err),
+    }
+}
+
 fn parse_cuda_devices_arg(value: &str) -> Result<CudaDevicesArg, String> {
     if value == "auto" {
         return Ok(CudaDevicesArg::Auto);
@@ -543,6 +649,150 @@ fn parse_cuda_devices_arg(value: &str) -> Result<CudaDevicesArg, String> {
     devices.sort_unstable();
     devices.dedup();
     Ok(CudaDevicesArg::Explicit(devices))
+}
+
+fn parse_cpu_cores_arg(value: &str) -> Result<CpuCoresArg, String> {
+    if value == "none" {
+        return Ok(CpuCoresArg::None);
+    }
+    if value == "auto" {
+        return Ok(CpuCoresArg::Auto);
+    }
+
+    let cores = parse_cpu_core_list(value)?;
+    Ok(CpuCoresArg::Explicit(cores))
+}
+
+fn parse_cpu_core_list(value: &str) -> Result<Vec<usize>, String> {
+    let mut cores = Vec::new();
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(format!("invalid --cpu-cores value: {value}"));
+        }
+        if let Some((start, end)) = trimmed.split_once('-') {
+            let start = start
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU core range in --cpu-cores: {trimmed}"))?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU core range in --cpu-cores: {trimmed}"))?;
+            if start > end {
+                return Err(format!("invalid descending CPU core range: {trimmed}"));
+            }
+            cores.extend(start..=end);
+        } else {
+            let id = trimmed
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU core id in --cpu-cores: {trimmed}"))?;
+            cores.push(id);
+        }
+    }
+    if cores.is_empty() {
+        return Err("--cpu-cores cannot be empty".to_string());
+    }
+    cores.sort_unstable();
+    cores.dedup();
+    Ok(cores)
+}
+
+fn parse_scheduler_name_arg(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("--scheduler-name cannot be empty".to_string());
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "invalid --scheduler-name value: {value}; use only ASCII letters, digits, '_', '-', or '.'"
+        ))
+    }
+}
+
+fn parse_positive_usize_arg(option: &str, value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {option} value: {value}"))?;
+    if parsed == 0 {
+        Err(format!("{option} must be positive"))
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn resolve_cpu_slots(
+    selection: &CpuCoresArg,
+    cpus_per_job: Option<usize>,
+) -> io::Result<Vec<Vec<usize>>> {
+    match selection {
+        CpuCoresArg::None => {
+            if cpus_per_job.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--cpus-per-job requires --cpu-cores auto or an explicit core list",
+                ));
+            }
+            Ok(Vec::new())
+        }
+        CpuCoresArg::Auto => {
+            let cpus_per_job = cpus_per_job.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--cpu-cores auto requires --cpus-per-job",
+                )
+            })?;
+            let total = std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1);
+            split_cpu_pool_into_slots((0..total).collect(), cpus_per_job)
+        }
+        CpuCoresArg::Explicit(cores) => {
+            let cpus_per_job = cpus_per_job.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--cpu-cores with an explicit core list requires --cpus-per-job",
+                )
+            })?;
+            split_cpu_pool_into_slots(cores.clone(), cpus_per_job)
+        }
+    }
+}
+
+fn split_cpu_pool_into_slots(
+    cores: Vec<usize>,
+    cpus_per_job: usize,
+) -> io::Result<Vec<Vec<usize>>> {
+    if cpus_per_job == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--cpus-per-job must be positive",
+        ));
+    }
+    if cpus_per_job > cores.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--cpus-per-job ({cpus_per_job}) exceeds CPU core pool size ({})",
+                cores.len()
+            ),
+        ));
+    }
+    let slots = cores
+        .chunks(cpus_per_job)
+        .filter(|chunk| chunk.len() == cpus_per_job)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    if slots.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CPU core pool produced no usable slots",
+        ))
+    } else {
+        Ok(slots)
+    }
 }
 
 pub fn resolve_cuda_devices(
@@ -722,32 +972,91 @@ fn idle_threshold_help(
     )
 }
 
-fn ensure_window_plan_absent(
+fn resolve_run_namespace(
     tmux: &TmuxClient,
     session: &str,
     current_window: &str,
-) -> io::Result<()> {
+    requested_name: Option<&str>,
+    job_count: usize,
+) -> io::Result<RunNamespace> {
     let windows = tmux.window_names(session)?;
-    let conflicts = find_window_conflicts(&windows, current_window);
-    if conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "window name conflict in session {session}: {}",
-                conflicts.join(", ")
-            ),
-        ))
+    if let Some(name) = requested_name {
+        let namespace = named_run_namespace(name);
+        let conflicts = find_window_conflicts(
+            &windows,
+            current_window,
+            &namespace.scheduler_window_name,
+            &planned_window_names(&namespace, job_count),
+        );
+        return if conflicts.is_empty() {
+            Ok(namespace)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "window name conflict in session {session}: {}",
+                    conflicts.join(", ")
+                ),
+            ))
+        };
     }
+
+    for idx in 1..=10_000 {
+        let namespace = auto_run_namespace(idx);
+        let conflicts = find_window_conflicts(
+            &windows,
+            current_window,
+            &namespace.scheduler_window_name,
+            &planned_window_names(&namespace, job_count),
+        );
+        if conflicts.is_empty() {
+            return Ok(namespace);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no available scheduler namespace in session {session}"),
+    ))
+}
+
+fn auto_run_namespace(idx: usize) -> RunNamespace {
+    if idx == 1 {
+        RunNamespace {
+            scheduler_window_name: DEFAULT_SCHEDULER_WINDOW_NAME.to_string(),
+            job_window_prefix: DEFAULT_JOB_WINDOW_PREFIX.to_string(),
+        }
+    } else {
+        RunNamespace {
+            scheduler_window_name: format!(
+                "{AUTO_SCHEDULER_WINDOW_PREFIX}{idx}{AUTO_SCHEDULER_WINDOW_SUFFIX}"
+            ),
+            job_window_prefix: format!("sched_{idx}_job"),
+        }
+    }
+}
+
+fn named_run_namespace(name: &str) -> RunNamespace {
+    RunNamespace {
+        scheduler_window_name: format!("__sched_{name}__"),
+        job_window_prefix: format!("{name}_job"),
+    }
+}
+
+fn window_name_for_job(job_window_prefix: &str, job_id: usize) -> String {
+    format!("{job_window_prefix}_{job_id}")
 }
 
 pub struct Scheduler {
     session: String,
     jobs: Vec<Job>,
     logs_dir: PathBuf,
+    job_window_prefix: String,
+    cpu_threads: Option<usize>,
     device_ids: Vec<usize>,
     gpu_in_use: Vec<bool>,
+    cpu_slots: Vec<Vec<usize>>,
+    cpu_in_use: Vec<bool>,
     keep_job_tabs: bool,
     verbose: bool,
 }
@@ -757,7 +1066,10 @@ impl Scheduler {
         session: String,
         logs_dir: PathBuf,
         device_ids: Vec<usize>,
+        cpu_slots: Vec<Vec<usize>>,
         commands: Vec<String>,
+        job_window_prefix: String,
+        cpu_threads: Option<usize>,
         keep_job_tabs: bool,
         verbose: bool,
     ) -> Self {
@@ -766,13 +1078,18 @@ impl Scheduler {
             .enumerate()
             .map(|(idx, cmd)| Job::new(idx + 1, cmd, &logs_dir))
             .collect();
-        let slots = device_ids.len();
+        let gpu_slots = device_ids.len();
+        let cpu_slot_count = cpu_slots.len();
         Self {
             session,
             jobs,
             logs_dir,
+            job_window_prefix,
+            cpu_threads,
             device_ids,
-            gpu_in_use: vec![false; slots],
+            gpu_in_use: vec![false; gpu_slots],
+            cpu_slots,
+            cpu_in_use: vec![false; cpu_slot_count],
             keep_job_tabs,
             verbose,
         }
@@ -807,6 +1124,7 @@ impl Scheduler {
             "CUDA devices: {}",
             format_cuda_devices(&self.device_ids)
         ));
+        lines.push(format!("CPU slots: {}", format_cpu_slots(&self.cpu_slots)));
         lines.push(format!("Logs dir: {}", self.logs_dir.display()));
         lines.push(format!("Total jobs: {total}"));
         lines.push(format!("Done: {}", done_ids.len()));
@@ -835,13 +1153,11 @@ impl Scheduler {
             if self.jobs[idx].status != JobStatus::Pending {
                 continue;
             }
-            let window_name = self.jobs[idx].name();
+            let window_name = self.job_window_name(self.jobs[idx].id);
             ensure_job_window_absent(&TmuxClient, &self.session, &window_name)?;
-            if self.device_ids.is_empty() {
-                self.jobs[idx].gpu_id = None;
-                self.jobs[idx].status = JobStatus::Scheduled;
-            } else if let Some(gpu_id) = self.acquire_gpu() {
-                self.jobs[idx].gpu_id = Some(gpu_id);
+            if let Some((gpu_id, cpu_cores)) = self.acquire_resources() {
+                self.jobs[idx].gpu_id = gpu_id;
+                self.jobs[idx].cpu_cores = cpu_cores;
                 self.jobs[idx].status = JobStatus::Scheduled;
             }
         }
@@ -853,8 +1169,13 @@ impl Scheduler {
             if job.status != JobStatus::Scheduled {
                 continue;
             }
-            let window_name = job.name();
-            let script = build_script(job, job.gpu_id);
+            let window_name = window_name_for_job(&self.job_window_prefix, job.id);
+            let script = build_script(
+                job,
+                job.gpu_id,
+                job.cpu_cores.as_deref(),
+                effective_cpu_threads(self.cpu_threads, job.cpu_cores.as_ref().map(Vec::len)),
+            );
             TmuxClient.start_job_window(
                 &self.session,
                 &window_name,
@@ -896,9 +1217,12 @@ impl Scheduler {
         let window_name = self.jobs[idx]
             .window_name
             .clone()
-            .unwrap_or_else(|| self.jobs[idx].name());
+            .unwrap_or_else(|| self.job_window_name(self.jobs[idx].id));
         if let Some(gpu_id) = self.jobs[idx].gpu_id.take() {
             self.release_gpu(gpu_id);
+        }
+        if let Some(cpu_cores) = self.jobs[idx].cpu_cores.take() {
+            self.release_cpu(&cpu_cores);
         }
         if self.verbose {
             println!(
@@ -911,11 +1235,48 @@ impl Scheduler {
         Ok(())
     }
 
+    fn acquire_resources(&mut self) -> Option<(Option<usize>, Option<Vec<usize>>)> {
+        let gpu_id = if self.device_ids.is_empty() {
+            None
+        } else {
+            match self.acquire_gpu() {
+                Some(gpu_id) => Some(gpu_id),
+                None => return None,
+            }
+        };
+
+        let cpu_cores = if self.cpu_slots.is_empty() {
+            None
+        } else {
+            match self.acquire_cpu() {
+                Some(cpu_cores) => Some(cpu_cores),
+                None => {
+                    if let Some(gpu_id) = gpu_id {
+                        self.release_gpu(gpu_id);
+                    }
+                    return None;
+                }
+            }
+        };
+
+        Some((gpu_id, cpu_cores))
+    }
+
     fn acquire_gpu(&mut self) -> Option<usize> {
         for (idx, in_use) in self.gpu_in_use.iter_mut().enumerate() {
             if !*in_use {
                 *in_use = true;
                 return self.device_ids.get(idx).copied();
+            }
+        }
+        None
+    }
+
+    fn acquire_cpu(&mut self) -> Option<Vec<usize>> {
+        for (idx, in_use) in self.cpu_in_use.iter_mut().enumerate() {
+            if !*in_use {
+                *in_use = true;
+                return self.cpu_slots.get(idx).cloned();
             }
         }
         None
@@ -927,6 +1288,18 @@ impl Scheduler {
                 *slot = false;
             }
         }
+    }
+
+    fn release_cpu(&mut self, cpu_cores: &[usize]) {
+        if let Some(slot_idx) = self.cpu_slots.iter().position(|slot| slot == cpu_cores) {
+            if let Some(slot) = self.cpu_in_use.get_mut(slot_idx) {
+                *slot = false;
+            }
+        }
+    }
+
+    fn job_window_name(&self, job_id: usize) -> String {
+        window_name_for_job(&self.job_window_prefix, job_id)
     }
 }
 
@@ -941,7 +1314,47 @@ fn format_cuda_devices(devices: &[usize]) -> String {
         .join(",")
 }
 
-fn build_dry_run_summary(options: &RunOptions, devices: &[usize], job_count: usize) -> String {
+fn format_cpu_threads(cpu_threads: Option<usize>) -> String {
+    cpu_threads
+        .map(|threads| threads.to_string())
+        .unwrap_or_else(|| "unlimited".to_string())
+}
+
+fn effective_cpu_threads(cpu_threads: Option<usize>, cpus_per_job: Option<usize>) -> Option<usize> {
+    cpu_threads.or(cpus_per_job)
+}
+
+fn format_cpu_cores(cores: Option<&[usize]>) -> String {
+    cores
+        .map(format_cpu_core_list)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_cpu_core_list(cores: &[usize]) -> String {
+    cores
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_cpu_slots(cpu_slots: &[Vec<usize>]) -> String {
+    if cpu_slots.is_empty() {
+        return "none".to_string();
+    }
+    cpu_slots
+        .iter()
+        .map(|slot| format!("[{}]", format_cpu_core_list(slot)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn build_dry_run_summary(
+    options: &RunOptions,
+    devices: &[usize],
+    cpu_slots: &[Vec<usize>],
+    job_count: usize,
+) -> String {
     let input = options
         .input_path
         .as_ref()
@@ -952,6 +1365,14 @@ fn build_dry_run_summary(options: &RunOptions, devices: &[usize], job_count: usi
     lines.push(format!("Input: {input}"));
     lines.push(format!("Jobs: {job_count}"));
     lines.push(format!("CUDA devices: {}", format_cuda_devices(devices)));
+    lines.push(format!(
+        "CPU threads per job: {}",
+        format_cpu_threads(effective_cpu_threads(
+            options.cpu_threads,
+            options.cpus_per_job
+        ))
+    ));
+    lines.push(format!("CPU slots: {}", format_cpu_slots(cpu_slots)));
     lines.push(format!(
         "Idle memory threshold: {} MiB",
         options.idle_memory_threshold_mb
@@ -965,26 +1386,29 @@ fn build_dry_run_summary(options: &RunOptions, devices: &[usize], job_count: usi
     lines.join("\n")
 }
 
-#[cfg(test)]
-fn planned_window_names(job_count: usize) -> Vec<String> {
-    std::iter::once(SCHEDULER_WINDOW_NAME.to_string())
-        .chain((1..=job_count).map(|id| format!("job_{id}")))
+fn planned_window_names(namespace: &RunNamespace, job_count: usize) -> Vec<String> {
+    std::iter::once(namespace.scheduler_window_name.clone())
+        .chain((1..=job_count).map(|id| window_name_for_job(&namespace.job_window_prefix, id)))
         .collect()
 }
 
-fn find_window_conflicts(existing_windows: &[String], current_window: &str) -> Vec<String> {
-    let job_window = Regex::new(r"^job_[0-9]+$").expect("job window regex should compile");
+fn find_window_conflicts(
+    existing_windows: &[String],
+    current_window: &str,
+    scheduler_window_name: &str,
+    planned_windows: &[String],
+) -> Vec<String> {
     let scheduler_window_count = existing_windows
         .iter()
-        .filter(|existing| existing.as_str() == SCHEDULER_WINDOW_NAME)
+        .filter(|existing| existing.as_str() == scheduler_window_name)
         .count();
     let mut conflicts = Vec::new();
 
     for window in existing_windows {
-        let is_conflict = if window.as_str() == SCHEDULER_WINDOW_NAME {
-            current_window != SCHEDULER_WINDOW_NAME || scheduler_window_count > 1
+        let is_conflict = if window.as_str() == scheduler_window_name {
+            current_window != scheduler_window_name || scheduler_window_count > 1
         } else {
-            job_window.is_match(window)
+            planned_windows.iter().any(|planned| planned == window)
         };
 
         if is_conflict && !conflicts.contains(window) {
@@ -1010,23 +1434,25 @@ fn build_tmux_shell_command(script: &str) -> String {
     format!("bash -lc {}", shell_quote(script))
 }
 
-pub fn build_script(job: &Job, gpu_id: Option<usize>) -> String {
-    let (gpu_display, cmd_display, runtime_env) = match gpu_id {
-        Some(gpu_id) => (
-            gpu_id.to_string(),
-            format!("CUDA_VISIBLE_DEVICES={gpu_id} {}", job.cmd),
-            format!("CUDA_VISIBLE_DEVICES={gpu_id} \\\nPYTHONUNBUFFERED=1 \\\n"),
-        ),
-        None => (
-            "none".to_string(),
-            format!("PYTHONUNBUFFERED=1 {}", job.cmd),
-            "PYTHONUNBUFFERED=1 \\\n".to_string(),
-        ),
-    };
+pub fn build_script(
+    job: &Job,
+    gpu_id: Option<usize>,
+    cpu_cores: Option<&[usize]>,
+    cpu_threads: Option<usize>,
+) -> String {
+    let gpu_display = gpu_id
+        .map(|gpu_id| gpu_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let env_pairs = build_runtime_env_pairs(gpu_id, cpu_threads);
+    let job_invocation = build_job_invocation(&job.cmd, cpu_cores);
+    let cmd_display = format!("{} {}", format_env_pairs_inline(&env_pairs), job_invocation);
+    let runtime_env = format_env_exports(&env_pairs);
     format!(
         r#"echo "================================"
 echo "JOB ID: {job_id}"
 echo "GPU: {gpu_display}"
+echo "CPU CORES: {cpu_cores_display}"
+echo "CPU THREADS: {cpu_threads_display}"
 echo "LOG: {log_path}"
 echo "================================"
 echo "[CMD]"
@@ -1035,7 +1461,8 @@ echo "--------------------------------"
 
 set -o pipefail
 
-{runtime_env}{cmd} \
+{runtime_env}
+{job_invocation} \
 2>&1 | tee {log_path_quoted}
 
 EXIT_CODE=$?
@@ -1046,13 +1473,68 @@ echo $EXIT_CODE > {exit_path_quoted}
 exit $EXIT_CODE"#,
         job_id = job.id,
         gpu_display = gpu_display,
+        cpu_cores_display = format_cpu_cores(cpu_cores),
+        cpu_threads_display = format_cpu_threads(cpu_threads),
         log_path = job.log_path.display(),
         cmd_display_quoted = shell_quote(&cmd_display),
         runtime_env = runtime_env,
-        cmd = job.cmd,
+        job_invocation = job_invocation,
         log_path_quoted = shell_quote_os(job.log_path.as_os_str()),
         exit_path_quoted = shell_quote_os(job.exit_path.as_os_str()),
     )
+}
+
+fn build_runtime_env_pairs(
+    gpu_id: Option<usize>,
+    cpu_threads: Option<usize>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = Vec::new();
+    if let Some(gpu_id) = gpu_id {
+        pairs.push(("CUDA_VISIBLE_DEVICES", gpu_id.to_string()));
+    }
+    pairs.push(("PYTHONUNBUFFERED", "1".to_string()));
+    if let Some(cpu_threads) = cpu_threads {
+        let value = cpu_threads.to_string();
+        pairs.extend([
+            ("OMP_NUM_THREADS", value.clone()),
+            ("MKL_NUM_THREADS", value.clone()),
+            ("OPENBLAS_NUM_THREADS", value.clone()),
+            ("NUMEXPR_NUM_THREADS", value.clone()),
+            ("VECLIB_MAXIMUM_THREADS", value.clone()),
+            ("BLIS_NUM_THREADS", value.clone()),
+            ("DIAMOND_TORCH_NUM_THREADS", value.clone()),
+            ("DIAMOND_TORCH_INTEROP_THREADS", "1".to_string()),
+        ]);
+    }
+    pairs
+}
+
+fn format_env_pairs_inline(pairs: &[(&'static str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("{key}={}", shell_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_env_exports(pairs: &[(&'static str, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(key, value)| format!("export {key}={}", shell_quote(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_job_invocation(cmd: &str, cpu_cores: Option<&[usize]>) -> String {
+    let shell_cmd = format!("bash -lc {}", shell_quote(cmd));
+    if let Some(cpu_cores) = cpu_cores {
+        format!(
+            "taskset -c {} {shell_cmd}",
+            shell_quote(&format_cpu_core_list(cpu_cores))
+        )
+    } else {
+        shell_cmd
+    }
 }
 
 fn read_exit_code(path: &Path) -> io::Result<Option<i32>> {
@@ -1144,6 +1626,14 @@ mod tests {
             "commands.txt".to_string(),
             "--logs-dir".to_string(),
             "artifacts".to_string(),
+            "--scheduler-name".to_string(),
+            "train-a".to_string(),
+            "--cpu-threads".to_string(),
+            "2".to_string(),
+            "--cpu-cores".to_string(),
+            "0-3,8,10-11".to_string(),
+            "--cpus-per-job".to_string(),
+            "2".to_string(),
             "--cuda-devices".to_string(),
             "0,2".to_string(),
             "--idle-memory-threshold-mb".to_string(),
@@ -1159,6 +1649,13 @@ mod tests {
             CliAction::Run(options) => {
                 assert_eq!(options.input_path, Some(PathBuf::from("commands.txt")));
                 assert_eq!(options.logs_dir, PathBuf::from("artifacts"));
+                assert_eq!(options.scheduler_name, Some("train-a".to_string()));
+                assert_eq!(options.cpu_threads, Some(2));
+                assert_eq!(
+                    options.cpu_cores,
+                    CpuCoresArg::Explicit(vec![0, 1, 2, 3, 8, 10, 11])
+                );
+                assert_eq!(options.cpus_per_job, Some(2));
                 assert_eq!(options.cuda_devices, CudaDevicesArg::Explicit(vec![0, 2]));
                 assert_eq!(options.idle_memory_threshold_mb, 96);
                 assert_eq!(options.idle_utilization_threshold, 25);
@@ -1174,13 +1671,17 @@ mod tests {
     fn help_text_explains_tmux_runtime_model() {
         let help = help_text();
         assert!(help.contains("Run inside an existing tmux session."));
-        assert!(help.contains("The current tab becomes __sched__."));
+        assert!(help.contains("The current tab becomes an available scheduler tab"));
         assert!(help.contains("By default, finished job tabs exit and disappear."));
         assert!(help.contains("Detect idle GPUs once at startup"));
         assert!(help.contains("--dry-run"));
         assert!(help.contains("--idle-memory-threshold-mb"));
         assert!(help.contains("--idle-utilization-threshold"));
         assert!(help.contains("--keep-job-tabs"));
+        assert!(help.contains("--scheduler-name"));
+        assert!(help.contains("--cpu-threads"));
+        assert!(help.contains("--cpu-cores"));
+        assert!(help.contains("--cpus-per-job"));
         assert!(help.contains("--verbose"));
         assert!(help.contains("tiny-exp-scheduler run [COMMANDS_FILE] [OPTIONS]"));
     }
@@ -1192,11 +1693,13 @@ mod tests {
             "python eval.py --ckpt 1000".to_string(),
             Path::new("logs"),
         );
-        let script = build_script(&job, Some(1));
+        let script = build_script(&job, Some(1), None, None);
         assert!(script.contains("JOB ID: 1"));
         assert!(script.contains("GPU: 1"));
+        assert!(script.contains("CPU CORES: none"));
+        assert!(script.contains("CPU THREADS: unlimited"));
         assert!(script.contains("set -o pipefail"));
-        assert!(script.contains("PYTHONUNBUFFERED=1"));
+        assert!(script.contains("PYTHONUNBUFFERED='1'"));
         assert!(script.contains("tee 'logs/job_1.log'"));
         assert!(script.contains("echo $EXIT_CODE > 'logs/job_1.exit'"));
     }
@@ -1204,10 +1707,34 @@ mod tests {
     #[test]
     fn build_script_without_gpu_skips_cuda_visible_devices() {
         let job = Job::new(1, "python train.py".to_string(), Path::new("logs"));
-        let script = build_script(&job, None);
+        let script = build_script(&job, None, None, None);
         assert!(script.contains("GPU: none"));
-        assert!(script.contains("PYTHONUNBUFFERED=1"));
+        assert!(script.contains("PYTHONUNBUFFERED='1'"));
         assert!(!script.contains("CUDA_VISIBLE_DEVICES="));
+    }
+
+    #[test]
+    fn build_script_with_cpu_threads_sets_thread_env() {
+        let job = Job::new(1, "python train.py".to_string(), Path::new("logs"));
+        let script = build_script(&job, Some(0), None, Some(2));
+        assert!(script.contains("CPU THREADS: 2"));
+        assert!(script.contains("CUDA_VISIBLE_DEVICES='0'"));
+        assert!(script.contains("OMP_NUM_THREADS='2'"));
+        assert!(script.contains("MKL_NUM_THREADS='2'"));
+        assert!(script.contains("OPENBLAS_NUM_THREADS='2'"));
+        assert!(script.contains("NUMEXPR_NUM_THREADS='2'"));
+        assert!(script.contains("DIAMOND_TORCH_NUM_THREADS='2'"));
+        assert!(script.contains("DIAMOND_TORCH_INTEROP_THREADS='1'"));
+    }
+
+    #[test]
+    fn build_script_with_cpu_cores_wraps_command_in_taskset() {
+        let job = Job::new(1, "python train.py --x 1".to_string(), Path::new("logs"));
+        let cores = vec![0, 1, 2, 3];
+        let script = build_script(&job, Some(0), Some(&cores), Some(4));
+        assert!(script.contains("CPU CORES: 0,1,2,3"));
+        assert!(script.contains("CPU THREADS: 4"));
+        assert!(script.contains("taskset -c '0,1,2,3' bash -lc 'python train.py --x 1'"));
     }
 
     #[test]
@@ -1245,6 +1772,26 @@ mod tests {
             parse_cuda_devices_arg("2,0,2,1").unwrap(),
             CudaDevicesArg::Explicit(vec![0, 1, 2])
         );
+    }
+
+    #[test]
+    fn parse_cpu_cores_accepts_ranges_and_lists() {
+        assert_eq!(
+            parse_cpu_cores_arg("4-6,1,6").unwrap(),
+            CpuCoresArg::Explicit(vec![1, 4, 5, 6])
+        );
+    }
+
+    #[test]
+    fn split_cpu_pool_into_fixed_size_slots() {
+        let slots = split_cpu_pool_into_slots(vec![0, 1, 2, 3, 4], 2).unwrap();
+        assert_eq!(slots, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn resolve_cpu_slots_requires_cpus_per_job_for_explicit_pool() {
+        let err = resolve_cpu_slots(&CpuCoresArg::Explicit(vec![0, 1]), None).unwrap_err();
+        assert!(err.to_string().contains("--cpus-per-job"));
     }
 
     #[test]
@@ -1363,6 +1910,7 @@ mod tests {
                     cmd: "a".to_string(),
                     status: JobStatus::Done,
                     gpu_id: None,
+                    cpu_cores: None,
                     window_name: Some("job_1".to_string()),
                     log_path: PathBuf::from("logs/job_1.log"),
                     exit_path: PathBuf::from("logs/job_1.exit"),
@@ -1372,6 +1920,7 @@ mod tests {
                     cmd: "b".to_string(),
                     status: JobStatus::Failed,
                     gpu_id: None,
+                    cpu_cores: None,
                     window_name: Some("job_2".to_string()),
                     log_path: PathBuf::from("logs/job_2.log"),
                     exit_path: PathBuf::from("logs/job_2.exit"),
@@ -1381,14 +1930,19 @@ mod tests {
                     cmd: "c".to_string(),
                     status: JobStatus::Cancelled,
                     gpu_id: None,
+                    cpu_cores: None,
                     window_name: Some("job_3".to_string()),
                     log_path: PathBuf::from("logs/job_3.log"),
                     exit_path: PathBuf::from("logs/job_3.exit"),
                 },
             ],
             logs_dir: PathBuf::from("logs"),
+            job_window_prefix: DEFAULT_JOB_WINDOW_PREFIX.to_string(),
+            cpu_threads: None,
             device_ids: vec![0, 1, 2],
             gpu_in_use: vec![false, false, false],
+            cpu_slots: vec![vec![0, 1], vec![2, 3]],
+            cpu_in_use: vec![false, false],
             keep_job_tabs: false,
             verbose: false,
         };
@@ -1396,6 +1950,7 @@ mod tests {
         let summary = scheduler.summary();
         assert!(summary.contains("Session: exp"));
         assert!(summary.contains("CUDA devices: cuda:0,cuda:1,cuda:2"));
+        assert!(summary.contains("CPU slots: [0,1],[2,3]"));
         assert!(summary.contains("Logs dir: logs"));
         assert!(summary.contains("Total jobs: 3"));
         assert!(summary.contains("Done: 1"));
@@ -1411,7 +1966,10 @@ mod tests {
             "session".to_string(),
             PathBuf::from("logs"),
             vec![3],
+            Vec::new(),
             vec!["python a.py".to_string(), "python b.py".to_string()],
+            DEFAULT_JOB_WINDOW_PREFIX.to_string(),
+            None,
             false,
             false,
         );
@@ -1439,7 +1997,10 @@ mod tests {
             "session".to_string(),
             logs_dir.clone(),
             vec![0],
+            Vec::new(),
             vec!["python train.py".to_string()],
+            DEFAULT_JOB_WINDOW_PREFIX.to_string(),
+            None,
             false,
             false,
         );
@@ -1462,7 +2023,10 @@ mod tests {
             "session".to_string(),
             logs_dir.clone(),
             vec![0],
+            Vec::new(),
             vec!["python train.py".to_string()],
+            DEFAULT_JOB_WINDOW_PREFIX.to_string(),
+            None,
             false,
             false,
         );
@@ -1479,7 +2043,7 @@ mod tests {
     #[test]
     fn rename_current_window_command_is_stable() {
         // This only verifies the public name contract used by docs and runtime.
-        assert_eq!(SCHEDULER_WINDOW_NAME, "__sched__");
+        assert_eq!(DEFAULT_SCHEDULER_WINDOW_NAME, "__sched__");
     }
 
     #[test]
@@ -1487,6 +2051,10 @@ mod tests {
         let options = RunOptions {
             input_path: Some(PathBuf::from("commands.txt")),
             logs_dir: PathBuf::from("artifacts"),
+            scheduler_name: None,
+            cpu_threads: Some(2),
+            cpu_cores: CpuCoresArg::Explicit(vec![0, 1, 2, 3]),
+            cpus_per_job: Some(2),
             cuda_devices: CudaDevicesArg::Explicit(vec![0, 2]),
             idle_memory_threshold_mb: 96,
             idle_utilization_threshold: 25,
@@ -1495,10 +2063,12 @@ mod tests {
             keep_job_tabs: false,
             verbose: false,
         };
-        let summary = build_dry_run_summary(&options, &[0, 2], 4);
+        let summary = build_dry_run_summary(&options, &[0, 2], &[vec![0, 1], vec![2, 3]], 4);
         assert!(summary.contains("===== Dry Run ====="));
         assert!(summary.contains("Jobs: 4"));
         assert!(summary.contains("CUDA devices: cuda:0,cuda:2"));
+        assert!(summary.contains("CPU threads per job: 2"));
+        assert!(summary.contains("CPU slots: [0,1],[2,3]"));
         assert!(summary.contains("Idle memory threshold: 96 MiB"));
         assert!(summary.contains("Idle utilization threshold: 25%"));
         assert!(summary.contains("Logs dir: artifacts"));
@@ -1506,12 +2076,19 @@ mod tests {
 
     #[test]
     fn find_window_conflicts_detects_scheduler_and_job_tabs() {
+        let namespace = auto_run_namespace(1);
+        let planned = planned_window_names(&namespace, 3);
         let existing = vec![
             "shell".to_string(),
             "__sched__".to_string(),
             "job_2".to_string(),
         ];
-        let conflicts = find_window_conflicts(&existing, "shell");
+        let conflicts = find_window_conflicts(
+            &existing,
+            "shell",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
         assert_eq!(
             conflicts,
             vec!["__sched__".to_string(), "job_2".to_string()]
@@ -1520,56 +2097,118 @@ mod tests {
 
     #[test]
     fn find_window_conflicts_allows_current_scheduler_window() {
+        let namespace = auto_run_namespace(1);
+        let planned = planned_window_names(&namespace, 1);
         let existing = vec!["__sched__".to_string(), "shell".to_string()];
-        let conflicts = find_window_conflicts(&existing, "__sched__");
+        let conflicts = find_window_conflicts(
+            &existing,
+            "__sched__",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
         assert!(conflicts.is_empty());
     }
 
     #[test]
     fn find_window_conflicts_rejects_duplicate_scheduler_window() {
+        let namespace = auto_run_namespace(1);
+        let planned = planned_window_names(&namespace, 1);
         let existing = vec![
             "__sched__".to_string(),
             "shell".to_string(),
             "__sched__".to_string(),
         ];
-        let conflicts = find_window_conflicts(&existing, "__sched__");
+        let conflicts = find_window_conflicts(
+            &existing,
+            "__sched__",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
         assert_eq!(conflicts, vec!["__sched__".to_string()]);
     }
 
     #[test]
     fn find_window_conflicts_still_rejects_job_tabs_from_current_scheduler_window() {
+        let namespace = auto_run_namespace(1);
+        let planned = planned_window_names(&namespace, 1);
         let existing = vec!["__sched__".to_string(), "job_1".to_string()];
-        let conflicts = find_window_conflicts(&existing, "__sched__");
+        let conflicts = find_window_conflicts(
+            &existing,
+            "__sched__",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
         assert_eq!(conflicts, vec!["job_1".to_string()]);
     }
 
     #[test]
-    fn find_window_conflicts_rejects_any_regex_job_tab() {
+    fn find_window_conflicts_allows_other_scheduler_job_tabs() {
+        let namespace = auto_run_namespace(2);
+        let planned = planned_window_names(&namespace, 2);
         let existing = vec!["shell".to_string(), "job_99".to_string()];
-        let conflicts = find_window_conflicts(&existing, "shell");
-        assert_eq!(conflicts, vec!["job_99".to_string()]);
-    }
-
-    #[test]
-    fn find_window_conflicts_ignores_job_like_non_matches() {
-        let existing = vec![
-            "job_1_old".to_string(),
-            "my_job_1".to_string(),
-            "job_alpha".to_string(),
-        ];
-        let conflicts = find_window_conflicts(&existing, "shell");
+        let conflicts = find_window_conflicts(
+            &existing,
+            "shell",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
         assert!(conflicts.is_empty());
     }
 
     #[test]
+    fn find_window_conflicts_rejects_current_scheduler_namespaced_job_tabs() {
+        let namespace = auto_run_namespace(2);
+        let planned = planned_window_names(&namespace, 2);
+        let existing = vec![
+            "job_1".to_string(),
+            "sched_2_job_1".to_string(),
+            "sched_3_job_1".to_string(),
+        ];
+        let conflicts = find_window_conflicts(
+            &existing,
+            "shell",
+            &namespace.scheduler_window_name,
+            &planned,
+        );
+        assert_eq!(conflicts, vec!["sched_2_job_1".to_string()]);
+    }
+
+    #[test]
     fn planned_window_names_match_runtime_contract() {
+        let namespace = auto_run_namespace(1);
         assert_eq!(
-            planned_window_names(3),
+            planned_window_names(&namespace, 3),
             vec![
                 "__sched__".to_string(),
                 "job_1".to_string(),
                 "job_2".to_string(),
                 "job_3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_window_names_for_auto_secondary_scheduler_are_namespaced() {
+        let namespace = auto_run_namespace(2);
+        assert_eq!(
+            planned_window_names(&namespace, 2),
+            vec![
+                "__sched_2__".to_string(),
+                "sched_2_job_1".to_string(),
+                "sched_2_job_2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_window_names_for_named_scheduler_are_namespaced() {
+        let namespace = named_run_namespace("train-a");
+        assert_eq!(
+            planned_window_names(&namespace, 2),
+            vec![
+                "__sched_train-a__".to_string(),
+                "train-a_job_1".to_string(),
+                "train-a_job_2".to_string(),
             ]
         );
     }

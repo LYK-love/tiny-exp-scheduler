@@ -60,6 +60,10 @@ Common options:
 - `--cuda-devices 0,2,5`
 - `--idle-memory-threshold-mb N`
 - `--idle-utilization-threshold N`
+- `--scheduler-name NAME`
+- `--cpu-threads N`
+- `--cpu-cores ARG`
+- `--cpus-per-job N`
 - `--logs-dir DIR`
 - `--keep-job-tabs`
 - `--verbose`
@@ -94,6 +98,46 @@ tiny-exp-scheduler run commands.txt \
 
 These options only decide whether a GPU is accepted as available. They do not free VRAM or stop other processes.
 
+## Multiple Schedulers In One tmux Session
+
+By default, the first scheduler in a tmux session uses `__sched__` with job tabs named `job_1`, `job_2`, and so on. Additional schedulers automatically get names such as `__sched_2__` with job tabs like `sched_2_job_1`.
+
+For stable names, pass an explicit namespace:
+
+```bash
+tiny-exp-scheduler run commands-a.txt --scheduler-name train-a --cuda-devices 0
+tiny-exp-scheduler run commands-b.txt --scheduler-name train-b --cuda-devices 1
+```
+
+Those runs use scheduler tabs `__sched_train-a__` and `__sched_train-b__`.
+
+## CPU Thread Limits
+
+Use `--cpu-cores` and `--cpus-per-job` when running several CPU-hungry GPU jobs at once:
+
+```bash
+tiny-exp-scheduler run commands.txt \
+  --cuda-devices 0,1,2,3 \
+  --cpu-cores 0-31 \
+  --cpus-per-job 8
+```
+
+This splits the CPU pool into exclusive slots (`0-7`, `8-15`, `16-23`, `24-31`) and launches each job with `taskset`, so child processes such as DataLoader workers inherit the same CPU affinity.
+
+If `--cpu-threads` is omitted, the thread limit defaults to `--cpus-per-job`. You can override it:
+
+```bash
+tiny-exp-scheduler run commands.txt \
+  --cuda-devices 0,1,2,3 \
+  --cpu-cores 0-31 \
+  --cpus-per-job 8 \
+  --cpu-threads 4
+```
+
+The scheduler sets common OpenMP/BLAS thread variables plus `DIAMOND_TORCH_NUM_THREADS` for each job.
+
+See [CPU resource scheduling](docs/cpu.md) for machine inspection commands, slot allocation details, and tuning guidance.
+
 ## Logs
 
 Default output:
@@ -110,6 +154,7 @@ logs/
 ## Docs
 
 - [CLI reference](docs/cli.md)
+- [CPU resource scheduling](docs/cpu.md)
 - [workflow demos](docs/workflows.md)
 - [design notes](docs/design.md)
 - [examples](examples)
