@@ -102,6 +102,8 @@ These options only decide whether a GPU is accepted as available. They do not fr
 
 By default, the first scheduler in a tmux session uses `s` with job tabs named `j1`, `j2`, and so on. Additional schedulers automatically get names such as `s2` with job tabs like `s2j1`.
 
+Long explicit scheduler names are compacted in tmux tab names, for example `s.twister-a1b2c3` and `twister-a1b2c3.j1`.
+
 For stable names, pass an explicit namespace:
 
 ```bash

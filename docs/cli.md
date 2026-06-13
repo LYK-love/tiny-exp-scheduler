@@ -109,8 +109,8 @@ Use a stable tmux namespace for this scheduler run.
 Rules:
 
 - `NAME` may contain ASCII letters, digits, `_`, `-`, and `.`
-- scheduler tab: `s.NAME`
-- job tabs: `NAME.j1`, `NAME.j2`, ...
+- scheduler tab: `s.NAME` for short names, or `s.PREFIX-HASH` for long names
+- job tabs: `NAME.j1`, `NAME.j2`, ... for short names, or `PREFIX-HASH.j1`, `PREFIX-HASH.j2`, ... for long names
 
 If omitted, the scheduler chooses the first available namespace in the current tmux session. The first default run uses `s` and `j1`; later concurrent runs use names such as `s2` and `s2j1`.
 

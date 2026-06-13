@@ -122,12 +122,13 @@ impl TmuxClient {
         keep_on_exit: bool,
     ) -> io::Result<()> {
         let shell_command = build_tmux_shell_command(script);
+        let target_session = tmux_session_target(session);
         let status = Command::new("tmux")
             .args([
                 "new-window",
                 "-d",
                 "-t",
-                session,
+                &target_session,
                 "-n",
                 window_name,
                 &shell_command,
@@ -1034,10 +1035,38 @@ fn auto_run_namespace(idx: usize) -> RunNamespace {
 }
 
 fn named_run_namespace(name: &str) -> RunNamespace {
+    let namespace_id = compact_namespace_id(name);
     RunNamespace {
-        scheduler_window_name: format!("s.{name}"),
-        job_window_prefix: format!("{name}.j"),
+        scheduler_window_name: format!("s.{namespace_id}"),
+        job_window_prefix: format!("{namespace_id}.j"),
     }
+}
+
+fn compact_namespace_id(name: &str) -> String {
+    const MAX_FULL_NAME_LEN: usize = 12;
+    const PREFIX_LEN: usize = 8;
+    const HASH_LEN: usize = 6;
+
+    if name.len() <= MAX_FULL_NAME_LEN {
+        return name.to_string();
+    }
+
+    let prefix_source = name
+        .split(['_', '-', '.'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(name);
+    let prefix: String = prefix_source.chars().take(PREFIX_LEN).collect();
+    let short_hash = stable_hash(name) & ((1_u64 << (HASH_LEN * 4)) - 1);
+    format!("{prefix}-{short_hash:0HASH_LEN$x}")
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn window_name_for_job(job_window_prefix: &str, job_id: usize) -> String {
@@ -1431,6 +1460,10 @@ fn build_tmux_shell_command(script: &str) -> String {
     format!("bash -lc {}", shell_quote(script))
 }
 
+fn tmux_session_target(session: &str) -> String {
+    format!("{session}:")
+}
+
 pub fn build_script(
     job: &Job,
     gpu_id: Option<usize>,
@@ -1738,6 +1771,11 @@ mod tests {
     fn build_tmux_shell_command_wraps_script_as_one_argument() {
         let command = build_tmux_shell_command("echo 'hello'");
         assert_eq!(command, r#"bash -lc 'echo '"'"'hello'"'"''"#);
+    }
+
+    #[test]
+    fn tmux_session_target_uses_session_scope() {
+        assert_eq!(tmux_session_target("twister"), "twister:");
     }
 
     #[test]
@@ -2177,6 +2215,17 @@ mod tests {
                 "train-a.j2".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn planned_window_names_for_long_named_scheduler_are_compact() {
+        let namespace = named_run_namespace("twister_offline_replay_ac_cpc_w_sweep");
+        let planned = planned_window_names(&namespace, 2);
+        assert_eq!(planned[0].len(), "s.twister-000000".len());
+        assert!(planned[0].starts_with("s.twister-"));
+        assert!(planned[1].starts_with("twister-"));
+        assert!(planned[1].ends_with(".j1"));
+        assert!(planned[2].ends_with(".j2"));
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
