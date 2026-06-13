@@ -163,7 +163,7 @@ Expected:
 Alternative action:
 
 ```bash
-tmux kill-window -t exp:job_3
+tmux kill-window -t exp:j3
 ```
 
 This also cancels that one job and releases its GPU.

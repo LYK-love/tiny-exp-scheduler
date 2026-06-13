@@ -6,10 +6,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-const DEFAULT_SCHEDULER_WINDOW_NAME: &str = "__sched__";
-const DEFAULT_JOB_WINDOW_PREFIX: &str = "job";
-const AUTO_SCHEDULER_WINDOW_PREFIX: &str = "__sched_";
-const AUTO_SCHEDULER_WINDOW_SUFFIX: &str = "__";
+const DEFAULT_SCHEDULER_WINDOW_NAME: &str = "s";
+const DEFAULT_JOB_WINDOW_PREFIX: &str = "j";
+const AUTO_SCHEDULER_WINDOW_PREFIX: &str = "s";
 
 struct TmuxClient;
 
@@ -428,15 +427,15 @@ USAGE:
 
 MODEL:
   Run inside an existing tmux session.
-  The current tab becomes an available scheduler tab, such as __sched__.
+  The current tab becomes an available scheduler tab, such as s.
   Job tabs are appended after it.
   The scheduler tab stays open for the final summary.
 
 OPTIONS:
   --logs-dir DIR      Directory for log and exit-code files. Default: logs
   --scheduler-name NAME
-                      Stable tmux namespace for this run. Window: __sched_NAME__.
-                      Jobs: NAME_job_1, NAME_job_2, ...
+                      Stable tmux namespace for this run. Window: s.NAME.
+                      Jobs: NAME.j1, NAME.j2, ...
   --cpu-threads N     Limit CPU compute threads per job by setting common
                       OpenMP/BLAS/PyTorch environment variables.
   --cpu-cores ARG     CPU core pool for affinity allocation: 'auto', 'none',
@@ -1028,23 +1027,21 @@ fn auto_run_namespace(idx: usize) -> RunNamespace {
         }
     } else {
         RunNamespace {
-            scheduler_window_name: format!(
-                "{AUTO_SCHEDULER_WINDOW_PREFIX}{idx}{AUTO_SCHEDULER_WINDOW_SUFFIX}"
-            ),
-            job_window_prefix: format!("sched_{idx}_job"),
+            scheduler_window_name: format!("{AUTO_SCHEDULER_WINDOW_PREFIX}{idx}"),
+            job_window_prefix: format!("s{idx}j"),
         }
     }
 }
 
 fn named_run_namespace(name: &str) -> RunNamespace {
     RunNamespace {
-        scheduler_window_name: format!("__sched_{name}__"),
-        job_window_prefix: format!("{name}_job"),
+        scheduler_window_name: format!("s.{name}"),
+        job_window_prefix: format!("{name}.j"),
     }
 }
 
 fn window_name_for_job(job_window_prefix: &str, job_id: usize) -> String {
-    format!("{job_window_prefix}_{job_id}")
+    format!("{job_window_prefix}{job_id}")
 }
 
 pub struct Scheduler {
@@ -2043,7 +2040,7 @@ mod tests {
     #[test]
     fn rename_current_window_command_is_stable() {
         // This only verifies the public name contract used by docs and runtime.
-        assert_eq!(DEFAULT_SCHEDULER_WINDOW_NAME, "__sched__");
+        assert_eq!(DEFAULT_SCHEDULER_WINDOW_NAME, "s");
     }
 
     #[test]
@@ -2078,34 +2075,23 @@ mod tests {
     fn find_window_conflicts_detects_scheduler_and_job_tabs() {
         let namespace = auto_run_namespace(1);
         let planned = planned_window_names(&namespace, 3);
-        let existing = vec![
-            "shell".to_string(),
-            "__sched__".to_string(),
-            "job_2".to_string(),
-        ];
+        let existing = vec!["shell".to_string(), "s".to_string(), "j2".to_string()];
         let conflicts = find_window_conflicts(
             &existing,
             "shell",
             &namespace.scheduler_window_name,
             &planned,
         );
-        assert_eq!(
-            conflicts,
-            vec!["__sched__".to_string(), "job_2".to_string()]
-        );
+        assert_eq!(conflicts, vec!["s".to_string(), "j2".to_string()]);
     }
 
     #[test]
     fn find_window_conflicts_allows_current_scheduler_window() {
         let namespace = auto_run_namespace(1);
         let planned = planned_window_names(&namespace, 1);
-        let existing = vec!["__sched__".to_string(), "shell".to_string()];
-        let conflicts = find_window_conflicts(
-            &existing,
-            "__sched__",
-            &namespace.scheduler_window_name,
-            &planned,
-        );
+        let existing = vec!["s".to_string(), "shell".to_string()];
+        let conflicts =
+            find_window_conflicts(&existing, "s", &namespace.scheduler_window_name, &planned);
         assert!(conflicts.is_empty());
     }
 
@@ -2113,39 +2099,27 @@ mod tests {
     fn find_window_conflicts_rejects_duplicate_scheduler_window() {
         let namespace = auto_run_namespace(1);
         let planned = planned_window_names(&namespace, 1);
-        let existing = vec![
-            "__sched__".to_string(),
-            "shell".to_string(),
-            "__sched__".to_string(),
-        ];
-        let conflicts = find_window_conflicts(
-            &existing,
-            "__sched__",
-            &namespace.scheduler_window_name,
-            &planned,
-        );
-        assert_eq!(conflicts, vec!["__sched__".to_string()]);
+        let existing = vec!["s".to_string(), "shell".to_string(), "s".to_string()];
+        let conflicts =
+            find_window_conflicts(&existing, "s", &namespace.scheduler_window_name, &planned);
+        assert_eq!(conflicts, vec!["s".to_string()]);
     }
 
     #[test]
     fn find_window_conflicts_still_rejects_job_tabs_from_current_scheduler_window() {
         let namespace = auto_run_namespace(1);
         let planned = planned_window_names(&namespace, 1);
-        let existing = vec!["__sched__".to_string(), "job_1".to_string()];
-        let conflicts = find_window_conflicts(
-            &existing,
-            "__sched__",
-            &namespace.scheduler_window_name,
-            &planned,
-        );
-        assert_eq!(conflicts, vec!["job_1".to_string()]);
+        let existing = vec!["s".to_string(), "j1".to_string()];
+        let conflicts =
+            find_window_conflicts(&existing, "s", &namespace.scheduler_window_name, &planned);
+        assert_eq!(conflicts, vec!["j1".to_string()]);
     }
 
     #[test]
     fn find_window_conflicts_allows_other_scheduler_job_tabs() {
         let namespace = auto_run_namespace(2);
         let planned = planned_window_names(&namespace, 2);
-        let existing = vec!["shell".to_string(), "job_99".to_string()];
+        let existing = vec!["shell".to_string(), "j99".to_string()];
         let conflicts = find_window_conflicts(
             &existing,
             "shell",
@@ -2159,18 +2133,14 @@ mod tests {
     fn find_window_conflicts_rejects_current_scheduler_namespaced_job_tabs() {
         let namespace = auto_run_namespace(2);
         let planned = planned_window_names(&namespace, 2);
-        let existing = vec![
-            "job_1".to_string(),
-            "sched_2_job_1".to_string(),
-            "sched_3_job_1".to_string(),
-        ];
+        let existing = vec!["j1".to_string(), "s2j1".to_string(), "s3j1".to_string()];
         let conflicts = find_window_conflicts(
             &existing,
             "shell",
             &namespace.scheduler_window_name,
             &planned,
         );
-        assert_eq!(conflicts, vec!["sched_2_job_1".to_string()]);
+        assert_eq!(conflicts, vec!["s2j1".to_string()]);
     }
 
     #[test]
@@ -2179,10 +2149,10 @@ mod tests {
         assert_eq!(
             planned_window_names(&namespace, 3),
             vec![
-                "__sched__".to_string(),
-                "job_1".to_string(),
-                "job_2".to_string(),
-                "job_3".to_string(),
+                "s".to_string(),
+                "j1".to_string(),
+                "j2".to_string(),
+                "j3".to_string(),
             ]
         );
     }
@@ -2192,11 +2162,7 @@ mod tests {
         let namespace = auto_run_namespace(2);
         assert_eq!(
             planned_window_names(&namespace, 2),
-            vec![
-                "__sched_2__".to_string(),
-                "sched_2_job_1".to_string(),
-                "sched_2_job_2".to_string(),
-            ]
+            vec!["s2".to_string(), "s2j1".to_string(), "s2j2".to_string(),]
         );
     }
 
@@ -2206,9 +2172,9 @@ mod tests {
         assert_eq!(
             planned_window_names(&namespace, 2),
             vec![
-                "__sched_train-a__".to_string(),
-                "train-a_job_1".to_string(),
-                "train-a_job_2".to_string(),
+                "s.train-a".to_string(),
+                "train-a.j1".to_string(),
+                "train-a.j2".to_string(),
             ]
         );
     }

@@ -100,7 +100,7 @@ These options only decide whether a GPU is accepted as available. They do not fr
 
 ## Multiple Schedulers In One tmux Session
 
-By default, the first scheduler in a tmux session uses `__sched__` with job tabs named `job_1`, `job_2`, and so on. Additional schedulers automatically get names such as `__sched_2__` with job tabs like `sched_2_job_1`.
+By default, the first scheduler in a tmux session uses `s` with job tabs named `j1`, `j2`, and so on. Additional schedulers automatically get names such as `s2` with job tabs like `s2j1`.
 
 For stable names, pass an explicit namespace:
 
@@ -109,7 +109,7 @@ tiny-exp-scheduler run commands-a.txt --scheduler-name train-a --cuda-devices 0
 tiny-exp-scheduler run commands-b.txt --scheduler-name train-b --cuda-devices 1
 ```
 
-Those runs use scheduler tabs `__sched_train-a__` and `__sched_train-b__`.
+Those runs use scheduler tabs `s.train-a` and `s.train-b`, with job tabs like `train-a.j1`.
 
 ## CPU Thread Limits
 

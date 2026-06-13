@@ -109,10 +109,10 @@ Use a stable tmux namespace for this scheduler run.
 Rules:
 
 - `NAME` may contain ASCII letters, digits, `_`, `-`, and `.`
-- scheduler tab: `__sched_NAME__`
-- job tabs: `NAME_job_1`, `NAME_job_2`, ...
+- scheduler tab: `s.NAME`
+- job tabs: `NAME.j1`, `NAME.j2`, ...
 
-If omitted, the scheduler chooses the first available namespace in the current tmux session. The first default run uses `__sched__` and `job_1`; later concurrent runs use names such as `__sched_2__` and `sched_2_job_1`.
+If omitted, the scheduler chooses the first available namespace in the current tmux session. The first default run uses `s` and `j1`; later concurrent runs use names such as `s2` and `s2j1`.
 
 ### `--cpu-threads N`
 
@@ -197,9 +197,9 @@ This is mainly useful when you want to watch jobs finish in real time.
 Example output:
 
 ```text
-[FINISHED] job_3 -> Done (exit=0)
-[FINISHED] job_4 -> Failed (exit=1)
-[FINISHED] job_2 -> Cancelled (exit=130)
+[FINISHED] j3 -> Done (exit=0)
+[FINISHED] j4 -> Failed (exit=1)
+[FINISHED] j2 -> Cancelled (exit=130)
 ```
 
 ### `--tick-seconds N`

@@ -57,7 +57,7 @@ The scheduler runs inside an existing `tmux` session.
 
 Within that session:
 
-- the current tab is renamed to an available scheduler tab, such as `__sched__`
+- the current tab is renamed to an available scheduler tab, such as `s`
 - each running *job* gets one new tab in that scheduler's namespace
 - each job tab contains one pane
 - that pane runs one shell command
@@ -68,17 +68,17 @@ So the runtime shape is:
 command source
     |
     v
-__sched__
+s
     |
-    +--> job_1
-    +--> job_2
-    +--> job_3
+    +--> j1
+    +--> j2
+    +--> j3
     +--> ...
 
-__sched_2__
+s2
     |
-    +--> sched_2_job_1
-    +--> sched_2_job_2
+    +--> s2j1
+    +--> s2j2
 ```
 
 ### Layer 4: Job Execution
@@ -315,13 +315,13 @@ The scheduler uses `tmux` as the runtime container and as part of job-state dete
 
 ### Scheduler tab
 
-The current tab becomes a scheduler tab. The first default scheduler uses `__sched__`; additional default schedulers in the same tmux session use names such as `__sched_2__`. With `--scheduler-name NAME`, the scheduler tab is `__sched_NAME__`.
+The current tab becomes a scheduler tab. The first default scheduler uses `s`; additional default schedulers in the same tmux session use names such as `s2`. With `--scheduler-name NAME`, the scheduler tab is `s.NAME`.
 
 The scheduler tab hosts the control loop and the final summary.
 
 ### Job tabs
 
-Each launched job gets one tab in the scheduler namespace. The first default scheduler uses `job_X`; additional default schedulers use names such as `sched_2_job_X`. With `--scheduler-name NAME`, jobs use `NAME_job_X`.
+Each launched job gets one tab in the scheduler namespace. The first default scheduler uses `jX`; additional default schedulers use names such as `s2jX`. With `--scheduler-name NAME`, jobs use `NAME.jX`.
 
 Each job tab contains one pane, and that pane runs one command.
 

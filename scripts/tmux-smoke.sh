@@ -37,17 +37,17 @@ tmux send-keys -t "$SESSION_NAME:launch" "cargo run -- run '$COMMANDS_FILE' --cu
 
 for _ in $(seq 1 30); do
   WINDOWS="$(tmux list-windows -t "$SESSION_NAME" -F '#{window_name}')"
-  if echo "$WINDOWS" | grep -q '^__sched__$' \
-    && echo "$WINDOWS" | grep -q '^job_1$' \
-    && echo "$WINDOWS" | grep -q '^job_2$'; then
+  if echo "$WINDOWS" | grep -q '^s$' \
+    && echo "$WINDOWS" | grep -q '^j1$' \
+    && echo "$WINDOWS" | grep -q '^j2$'; then
     break
   fi
   sleep 1
 done
 
-echo "$WINDOWS" | grep -q '^__sched__$'
-echo "$WINDOWS" | grep -q '^job_1$'
-echo "$WINDOWS" | grep -q '^job_2$'
+echo "$WINDOWS" | grep -q '^s$'
+echo "$WINDOWS" | grep -q '^j1$'
+echo "$WINDOWS" | grep -q '^j2$'
 
 for _ in $(seq 1 30); do
   if test -f "$LOG_DIR/job_1.exit" && test -f "$LOG_DIR/job_2.exit"; then
